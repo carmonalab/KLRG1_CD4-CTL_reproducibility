@@ -560,7 +560,7 @@ cellular-component annotations.
 DefaultAssay(int) <- "RNA"
 Idents(int) <- "annotation"
 
-fa <- FindMarkers(
+deg_markers_df <- FindMarkers(
   int,
   ident.1 = "Cytotoxic",
   assay = "RNA",
@@ -571,24 +571,39 @@ fa <- FindMarkers(
   verbose = TRUE
 )
 
-fa <- fa %>%
+deg_markers_df <- deg_markers_df %>%
   tibble::rownames_to_column("gene") %>%
   dplyr::filter(!grepl("^HLA|^TR[AB]", gene))
 
-cat("Number of Cytotoxic-vs-rest DEGs after filtering: ", nrow(fa), "\n", sep = "")
-head(fa)
+cat("Number of Cytotoxic-vs-rest DEGs after filtering: ", nrow(deg_markers_df), "\n", sep = "")
+head(deg_markers_df)
 ```
 
 ## 10.2 Annotate membrane receptor markers
 
 ```{r ctl-markers-classify}
-source(here::here("scRNA-seq", "ctl_markers_classify.R"))
+source(here::here("scRNA-seq", "markers_classify.R"))
 
-ctl_classify <- classify_ctl_markers(fa)
-fa <- ctl_classify$markers
+# Extract a clean gene-symbol vector from the DEG table.
+gene_symbols <- unique(deg_markers_df$gene)
+
+# Classify symbols by receptor function and membrane localization.
+gene_classification <- classify_gene_symbols_surface_receptors(
+  gene_symbols = gene_symbols
+)
+
+# Add membrane_receptor labels back to the DEG table.
+deg_markers_df <- annotate_marker_table_with_receptor_class(
+  marker_table = deg_markers_df,
+  membrane_receptor_genes = gene_classification$membrane_receptor_genes,
+  gene_col = "gene",
+  class_col = "membrane_receptor",
+  positive_label = "yes",
+  negative_label = "no"
+)
 
 cat("Receptor class summary:\n")
-print(table(fa$membrane_receptor, useNA = "ifany"))
+print(table(deg_markers_df$membrane_receptor, useNA = "ifany"))
 ```
 
 ## 10.3 Plot top Cytotoxic markers
@@ -599,7 +614,7 @@ bar_cols <- c(
   "Other genes" = "#C5CCD3"
 )
 
-gene_markers_ctl <- fa %>%
+gene_markers_ctl <- deg_markers_df %>%
   dplyr::mutate(
     receptor_class = ifelse(membrane_receptor == "yes", "Cell-surface receptor", "Other genes"),
     receptor_class = factor(receptor_class, levels = c("Other genes", "Cell-surface receptor"))
@@ -637,7 +652,7 @@ gene_markers_ctl
 
 ```{r ctl-markers-save}
 out_ctl <- file.path(cache_dir, "CD4_Cytotoxic_vs_rest_markers.rds")
-saveRDS(fa, out_ctl)
+saveRDS(deg_markers_df, out_ctl)
 cat("Saved Cytotoxic marker table: ", out_ctl, "\n", sep = "")
 ```
 
