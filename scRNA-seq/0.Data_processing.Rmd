@@ -1,0 +1,398 @@
+---
+title: "scRNA-seq Data Processing — Cenerenti et al."
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Overview
+
+This script reproduces the scRNA-seq/CITE-seq data processing for
+Cenerenti et al. starting from the raw feature/barcode matrices deposited
+on Zenodo. It covers:
+
+1. Downloading and unzipping the count matrices and sample metadata
+2. Quality-control filtering
+3. Hashtag-based demultiplexing to assign cells to their sample of origin
+4. Merging with the experimental metadata spreadsheet
+5. Saving a single merged Seurat object ready for downstream analysis
+
+Raw data: <https://doi.org/10.5281/zenodo.18683366>
+
+The output file `cache/all_samples_merged.rds` is a Seurat object containing
+all captures, with per-cell metadata (patient, HLA allele, tissue, antigen
+specificity, T cell subset) already attached.
+
+---
+
+# 0 — Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Reproducible R environment (recommended)
+
+To reproduce the exact software environment used for this analysis,
+restore packages from the repository `renv.lock` file before running
+the pipeline.
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+```{r packages}
+library(Seurat)   # >= 4.0
+library(readxl)   # parse metadata spreadsheet
+library(ggplot2)
+library(patchwork)
+library(tidyverse)
+```
+
+```{r paths}
+# All outputs are written here; the directory already exists in the repo.
+cache_dir <- here::here("scRNA-seq", "cache")
+```
+
+---
+
+# 1 — Download data from Zenodo
+
+Files are downloaded only when not already present, so re-running this
+chunk is safe.
+
+The Zenodo record contains one zip archive per capture (C0.zip – C8.zip)
+and a `metadata.xlsx` file that maps every hashtag barcode to its sample.
+
+```{r download}
+zenodo_url <- "https://zenodo.org/records/18683366/files"
+
+# Files expected in the record
+zenodo_files <- c(paste0("C", 0:8, "_sample_feature_bc_matrix.zip"), "metadata.xlsx")
+
+for (f in zenodo_files) {
+  dest <- file.path(cache_dir, f)
+  if (!file.exists(dest)) {
+    cat("Downloading ", f, " ...\n", sep = "")
+    download.file(
+      url      = paste0(zenodo_url, "/", f, "?download=1"),
+      destfile = dest,
+      mode     = "wb",
+      quiet    = FALSE
+    )
+  } else {
+    cat(f, " already present — skipping download.\n", sep = "")
+  }
+}
+```
+
+---
+
+# 2 — Load metadata spreadsheet
+
+`metadata.xlsx` has one row per hashtag and provides all the biological
+context needed to annotate cells after demultiplexing.
+
+```{r load-metadata}
+meta <- read_excel(file.path(cache_dir, "metadata.xlsx"))
+
+# Preview
+print(meta)
+```
+
+```{r parse-metadata}
+# Derive a clean numeric hashtag index ("Hashtag 1" -> 1, etc.)
+# and biological annotation fields used later.
+meta <- meta %>%
+  mutate(
+    ht_index = as.integer(str_extract(`N°`, "[0-9]+")),
+
+    # Short antigen label (NA for bulk CD4/CD8 populations)
+    antigen = case_when(
+      str_detect(Population, regex("NY-ESO|NYESO", ignore_case = TRUE)) ~ "NYESO",
+      str_detect(Population, regex("\\bHA\\b",     ignore_case = TRUE)) ~ "HA",
+      str_detect(Population, regex("MAGE",         ignore_case = TRUE)) ~ "MAGE",
+      str_detect(Population, regex("\\bTT\\b",     ignore_case = TRUE)) ~ "TT",
+      TRUE ~ NA_character_
+    ),
+
+    # Antigen-specificity class
+    # NY-ESO-1 and MAGE-A3 are tumour antigens;
+    # HA (influenza) and TT (tetanus toxin) are pathogen-derived controls.
+    specificity = case_when(
+      antigen %in% c("NYESO", "MAGE") ~ "tumor_specific",
+      antigen %in% c("HA",    "TT")   ~ "virus_specific",
+      TRUE                            ~ "non_specific"
+    ),
+
+    # T cell subset — all tetramer-enriched populations are CD4+
+    T_subset = if_else(Population == "CD8", "CD8", "CD4"),
+
+    # Human-readable HTO label that will be set as rowname of the HTG assay
+    # and later appear in the MULTI_ID metadata column.
+    # Format: <Capture>-HT<N>-<CD4|CD8>[-<antigen>]-<Type>
+    ht_label = if_else(
+      is.na(antigen),
+      paste(Capture, paste0("HT", ht_index), T_subset, Type, sep = "-"),
+      paste(Capture, paste0("HT", ht_index), T_subset, antigen, Type, sep = "-")
+    )
+  )
+
+# Show the derived labels for verification
+meta %>%
+  select(Capture, `N°`, Patient, HLA, Population, Type,
+         antigen, specificity, T_subset, ht_label)
+```
+
+---
+
+# 3 — Load feature/barcode matrices (unzip on the fly)
+
+Each capture zip is extracted into `cache/` before reading with
+`Seurat::Read10X`. The HTO assay row names are set to the human-readable
+labels derived from `metadata.xlsx`.
+
+```{r load-matrices}
+captures <- sort(unique(meta$Capture))   # "C0", "C1", ..., "C8"
+
+samples <- lapply(setNames(captures, captures), function(cap) {
+
+  # ── 1. Unzip on the fly ────────────────────────────────────────────────────
+  # Zips are named <cap>_sample_feature_bc_matrix.zip and extract directly to
+  # a folder of the same name (no extra subdirectory).
+  zip_path <- file.path(cache_dir, paste0(cap, "_sample_feature_bc_matrix.zip"))
+  mat_dir  <- file.path(cache_dir, paste0(cap, "_sample_feature_bc_matrix"))
+
+  if (!dir.exists(mat_dir)) {
+    cat("Unzipping ", basename(zip_path), " ...\n", sep = "")
+    unzip(zip_path, exdir = cache_dir)
+  }
+
+  # ── 2. Read gene-expression + hashtag matrices ─────────────────────────────
+  mat <- Seurat::Read10X(mat_dir)
+
+  seu <- CreateSeuratObject(
+    counts  = mat$`Gene Expression`,
+    project = cap
+  )
+
+  # ── 3. Attach hashtag (HTG) assay with labelled row names ─────────────────
+  ht_meta <- meta %>%
+    filter(Capture == cap) %>%
+    arrange(ht_index)
+
+  # The number of HTO features in the matrix must match the metadata rows
+  stopifnot(nrow(mat$`Antibody Capture`) == nrow(ht_meta))
+
+  rownames(mat$`Antibody Capture`) <- ht_meta$ht_label
+  seu[["HTG"]] <- CreateAssayObject(counts = mat$`Antibody Capture`)
+
+  cat(cap, ": ", ncol(seu), " cells loaded\n", sep = "")
+
+  # ── 4. Remove extracted folder to save disk space ─────────────────────────
+  unlink(mat_dir, recursive = TRUE)
+  cat(cap, ": extracted folder removed.\n", sep = "")
+
+  return(seu)
+})
+```
+
+---
+
+# 4 — Quality control
+
+## 4.1 Compute QC metrics
+
+```{r qc-metrics}
+for (i in seq_along(samples)) {
+  samples[[i]][["percent.mt"]] <- PercentageFeatureSet(
+    samples[[i]], pattern = "^MT-"
+  )
+}
+```
+
+## 4.2 Visualise before filtering
+
+```{r qc-violin, fig.height=4.5, fig.width=10}
+# VlnPlot with multiple features already returns a patchwork object
+for (s in names(samples)) {
+  p <- VlnPlot(samples[[s]],
+               features = c("nFeature_RNA", "nCount_RNA", "percent.mt"),
+               ncol = 3, pt.size = 0) &
+         theme(legend.position = "none")
+  print(p + patchwork::plot_annotation(title = s))
+}
+```
+
+## 4.3 Filter low-quality cells
+
+Thresholds match `Integrated_analysis.Rmd` and `Added_samples_analysis.Rmd`:
+- `nFeature_RNA > 300` — removes empty droplets / very low-complexity cells
+- `percent.mt < 8`     — removes broken or dying cells
+
+```{r qc-filter}
+for (i in seq_along(samples)) {
+  n_before <- ncol(samples[[i]])
+  samples[[i]] <- subset(
+    samples[[i]],
+    subset = nFeature_RNA > 300 & percent.mt < 8
+  )
+  cat(names(samples)[i], ": ", n_before,
+      " -> ", ncol(samples[[i]]), " cells after QC filter\n", sep = "")
+}
+```
+
+---
+
+# 5 — Hashtag demultiplexing
+
+Cells are assigned to their sample of origin based on HTO signal.
+`MULTIseqDemux` on CLR-normalised counts was used in the original
+analysis and is reproduced here with the same parameters.
+
+## 5.1 Normalise HTG assay and call sample identity
+
+```{r demux-call}
+for (i in seq_along(samples)) {
+
+  # CLR normalisation of the hashtag assay
+  samples[[i]] <- NormalizeData(
+    samples[[i]],
+    assay                = "HTG",
+    normalization.method = "CLR"
+  )
+
+  # Sample assignment per cell
+  samples[[i]] <- MULTIseqDemux(
+    samples[[i]],
+    assay      = "HTG",
+    autoThresh = TRUE,
+    maxiter    = 20
+  )
+
+  # Re-level: HTO labels first (ordered), then Negative / Doublet
+  samples[[i]]$MULTI_ID <- factor(
+    samples[[i]]$MULTI_ID,
+    levels = c(rownames(samples[[i]][["HTG"]]), "Negative", "Doublet")
+  )
+
+  cat(names(samples)[i], " - demultiplexing:\n", sep = "")
+  print(table(samples[[i]]$MULTI_ID))
+}
+```
+
+## 5.2 Inspect HTO signal distributions
+
+```{r demux-ridge, fig.height=10, fig.width=15}
+for (i in seq_along(samples)) {
+  plot(
+    RidgePlot(
+      samples[[i]],
+      assay    = "HTG",
+      features = rownames(samples[[i]][["HTG"]]),
+      ncol     = 3
+    ) + ggtitle(names(samples)[i])
+  )
+}
+```
+
+## 5.3 Remove doublets and negatives
+
+```{r demux-filter}
+for (i in seq_along(samples)) {
+  n_before <- ncol(samples[[i]])
+  samples[[i]] <- subset(
+    samples[[i]],
+    subset = MULTI_ID %in% c("Doublet", "Negative"),
+    invert = TRUE
+  )
+  cat(names(samples)[i], ": ", n_before,
+      " -> ", ncol(samples[[i]]),
+      " cells after doublet/negative removal\n", sep = "")
+}
+```
+
+---
+
+# 6 — Attach experimental metadata
+
+Each cell is annotated with patient, HLA allele, antigen, antigen-specificity
+class, T cell subset (CD4/CD8) and tissue of origin (PBMC / TILN). Values
+are looked up from `metadata.xlsx` via the MULTI_ID hashtag label — no
+hardcoding per capture.
+
+```{r add-metadata}
+for (cap in names(samples)) {
+
+  # Build a lookup keyed on the HTO label
+  lut <- meta %>%
+    filter(Capture == cap) %>%
+    select(ht_label, Patient, HLA, antigen, specificity, T_subset, Type) %>%
+    column_to_rownames("ht_label")
+
+  idx <- match(as.character(samples[[cap]]$MULTI_ID), rownames(lut))
+
+  samples[[cap]]$patient     <- lut$Patient[idx]
+  samples[[cap]]$HLA         <- lut$HLA[idx]
+  samples[[cap]]$antigen     <- lut$antigen[idx]
+  samples[[cap]]$specificity <- lut$specificity[idx]
+  samples[[cap]]$T_subset    <- lut$T_subset[idx]
+  samples[[cap]]$tissue      <- lut$Type[idx]   # PBMC or TILN
+}
+
+# Spot-check: one row per hashtag for a representative capture
+samples[["C0"]]@meta.data %>%
+  distinct(MULTI_ID, patient, HLA, antigen, specificity, T_subset, tissue) %>%
+  arrange(MULTI_ID)
+```
+
+---
+
+# 7 — Merge all captures and normalise
+
+All nine captures are merged into a single Seurat object. Log-normalisation
+(scale factor 10 000) is applied so the object is ready for variable-feature
+selection and integration in downstream scripts.
+
+```{r merge}
+merged <- merge(
+  samples[[1]],
+  y          = samples[-1],
+  merge.data = TRUE
+)
+
+merged <- NormalizeData(merged)
+
+# Summary
+cat("Merged object: ", ncol(merged), " cells x ", nrow(merged), " genes\n", sep = "")
+cat("Captures : ", paste(sort(unique(merged$orig.ident)), collapse = ", "), "\n", sep = "")
+cat("Patients : ", paste(sort(na.omit(unique(merged$patient))), collapse = ", "), "\n", sep = "")
+cat("T subsets: ", paste(table(merged$T_subset), collapse = " | "), "\n", sep = "")
+cat("Tissues  : ", paste(table(merged$tissue),   collapse = " | "), "\n", sep = "")
+```
+
+---
+
+# 8 — Save
+
+```{r save}
+out_path <- file.path(cache_dir, "all_samples_merged.rds")
+saveRDS(merged, out_path)
+cat("Saved: ", out_path, "\n", sep = "")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
