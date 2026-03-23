@@ -51,7 +51,7 @@ renv::restore(prompt = FALSE)
 
 ```{r packages}
 library(Seurat)   # >= 4.0
-library(readxl)   # parse metadata spreadsheet
+library(openxlsx) # read/write metadata spreadsheet (.xlsx)
 library(ggplot2)
 library(patchwork)
 library(tidyverse)
@@ -102,7 +102,7 @@ for (f in zenodo_files) {
 context needed to annotate cells after demultiplexing.
 
 ```{r load-metadata}
-meta <- read_excel(file.path(cache_dir, "metadata.xlsx"))
+meta <- openxlsx::read.xlsx(file.path(cache_dir, "metadata.xlsx"))
 
 # Preview
 print(meta)
