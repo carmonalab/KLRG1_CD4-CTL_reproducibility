@@ -51,6 +51,7 @@ knitr::opts_chunk$set(
 
 # Load utility functions for this analysis
 source(here::here("scRNA-seq", "utils.R"))
+
 ```
 
 ## Reproducible R environment (recommended)
@@ -225,7 +226,10 @@ print(table(int$annotation, useNA = "ifany"))
 Corresponding to Figure 1D
 
 ```{r umap-annotation}
-UMAPPlot(int, group.by = "annotation", label = TRUE, repel = TRUE) +
+UMAPPlot(int, group.by = "annotation",
+         label = TRUE,
+         repel = TRUE,
+         cols = cd4_annotation_palette) +
   ggtitle("Manual annotation")
 ```
 
@@ -289,7 +293,7 @@ UMAPPlot(cd4ref) + ggtitle("ProjecTILs CD4 reference map")
 
 ```{r projectils-classify-total}
 pred_list <- list()
-# split by sample to avoid batch effects
+# split by capture, supposed to have the batch effect
 split_cd4 <- SplitObject(cd4_total, split.by = "MULTI_classification")
 
 for (i in seq_along(split_cd4)) {
@@ -407,6 +411,7 @@ print(table(proj$functional.cluster, useNA = "ifany"))
 proj_prop <- prop.table(table(proj$functional.cluster))
 print(round(proj_prop, 3))
 ```
+
 ## 7.3 Gene markers tumor-specific cells
 
 Corresponding to Figure 1G
@@ -549,7 +554,7 @@ if (length(tis_in_proj) > 1 && all(c("PBMC", "TILN") %in% tis_in_proj)) {
 
 # 10 — Cytotoxic CD4 marker discovery
 
-Following the `simple_new_analysis.Rmd` strategy, we identify DEGs for
+We identify DEGs for
 Cytotoxic CD4 cells versus all other annotated CD4 states, then classify
 markers as cell-surface receptors using GO molecular-function and
 cellular-component annotations.
@@ -606,7 +611,9 @@ cat("Receptor class summary:\n")
 print(table(deg_markers_df$membrane_receptor, useNA = "ifany"))
 ```
 
-## 10.3 Plot top Cytotoxic markers
+## 10.3 Plot 20 top Cytotoxic markers
+
+Corresponding to Fig 1J
 
 ```{r ctl-markers-plot, fig.width=7, fig.height=5}
 bar_cols <- c(
@@ -614,13 +621,15 @@ bar_cols <- c(
   "Other genes" = "#C5CCD3"
 )
 
+top <- 20
+
 gene_markers_ctl <- deg_markers_df %>%
   dplyr::mutate(
     receptor_class = ifelse(membrane_receptor == "yes", "Cell-surface receptor", "Other genes"),
     receptor_class = factor(receptor_class, levels = c("Other genes", "Cell-surface receptor"))
   ) %>%
   dplyr::arrange(desc(avg_log2FC)) %>%
-  dplyr::slice_head(n = 20) %>%
+  dplyr::slice_head(n = top) %>%
   dplyr::mutate(gene = forcats::fct_reorder(gene, avg_log2FC)) %>%
   ggplot(aes(x = avg_log2FC, y = gene, fill = receptor_class)) +
   geom_col(width = 0.75, color = "white", linewidth = 0.2) +
