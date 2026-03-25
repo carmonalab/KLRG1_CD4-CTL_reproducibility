@@ -51,6 +51,7 @@ knitr::opts_chunk$set(
 
 # Load utility functions for this analysis
 source(here::here("scRNA-seq", "utils.R"))
+source(here::here("scRNA-seq", "klrg1_ratio_utils.R"))
 
 ```
 
@@ -549,6 +550,73 @@ if (length(tis_in_proj) > 1 && all(c("PBMC", "TILN") %in% tis_in_proj)) {
     sep = ""
   )
 }
+```
+
+
+# 9.3 — KLRG1+ vs KLRG1- CTL proportion (our data)
+
+
+
+```{r klrg1-classification}
+DefaultAssay(int) <- "integrated"
+
+require(scGate)
+my_scGate_model <- gating_model(name = "KLRG1",
+                                signature = "KLRG1") 
+int <- scGate(int,
+              model = my_scGate_model,
+              assay = "integrated",
+              ncores = 4)
+
+
+
+
+int$KLRG1_expression <- ifelse(int$is.pure == "Pure",
+                               "KLRG1+", "KLRG1-")
+DimPlot(int, group.by = "KLRG1_expression")
+```
+Corresponding to Figure 2A (left)
+
+```{r ratio-klrg1-our-data}
+
+rat_klrg1 <- compute_klrg1_cytotoxic_ratio(
+  metadata = int@meta.data,
+  patient_col = "patient",
+  state_col = "annotation",
+  cytotoxic_label = "Cytotoxic",
+  klrg1_col = "KLRG1_expression",
+  min_cells = 10,
+  pseudocount = 1
+)
+
+ratio_boxplot_klrg1 <- rat_klrg1 %>%
+  ggplot(aes(KLRG1_expression, ratio_log2, fill = KLRG1_expression)) +
+  geom_boxplot(
+    outlier.color = NA,
+    show.legend = FALSE,
+    alpha = 0.4
+  ) +
+  scale_fill_manual(values = c("KLRG1+" = "#0072B2", "KLRG1-" = "#D55E00")) +
+  geom_jitter(
+    color = "grey22",
+    show.legend = FALSE,
+    shape = 21,
+    width = 0.1,
+    alpha = 0.8
+  ) +
+  geom_hline(yintercept = 0, color = "grey40", linetype = "dashed") +
+  labs(
+    x = "KLRG1 compartment",
+    y = "log2 ratio Cytotoxic / Other",
+    title = "KLRG1 compartments — total CD4"
+  ) +
+  ggpubr::theme_classic2() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.x = element_blank()
+  )
+
+ratio_boxplot_klrg1
 ```
 
 
