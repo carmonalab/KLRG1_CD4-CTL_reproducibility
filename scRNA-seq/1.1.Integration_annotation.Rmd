@@ -50,8 +50,8 @@ knitr::opts_chunk$set(
 )
 
 # Load utility functions for this analysis
-source(here::here("scRNA-seq", "utils.R"))
-source(here::here("scRNA-seq", "klrg1_ratio_utils.R"))
+source(here::here("scRNA-seq", "utils", "utils.R"))
+source(here::here("scRNA-seq", "utils", "klrg1_ratio_utils.R"))
 
 ```
 
@@ -655,7 +655,7 @@ head(deg_markers_df)
 ## 10.2 Annotate membrane receptor markers
 
 ```{r ctl-markers-classify}
-source(here::here("scRNA-seq", "markers_classify.R"))
+source(here::here("scRNA-seq", "utils", "markers_classify.R"))
 
 # Extract a clean gene-symbol vector from the DEG table.
 gene_symbols <- unique(deg_markers_df$gene)

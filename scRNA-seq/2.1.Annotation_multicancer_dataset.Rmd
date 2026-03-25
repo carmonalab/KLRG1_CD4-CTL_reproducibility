@@ -371,7 +371,7 @@ deg_markers_df <- FindMarkers(
   tibble::rownames_to_column("gene") %>%
   dplyr::filter(!grepl("^HLA|^TR[AB]", gene))
 
-source(here::here("scRNA-seq", "markers_classify.R"))
+source(here::here("scRNA-seq", "utils", "markers_classify.R"))
 
 gene_symbols <- unique(deg_markers_df$gene)
 gene_classification <- classify_gene_symbols_surface_receptors(gene_symbols = gene_symbols)
@@ -434,7 +434,7 @@ gene_markers_ctl_zheng
 # 8 - Proportions of CTL/non-CTL within KLRG1+ and KLRG1- (Zheng)
 
 ```{r}
-source(here::here("scRNA-seq", "klrg1_ratio_utils.R"))
+source(here::here("scRNA-seq", "utils", "klrg1_ratio_utils.R"))
 ```
 
 Consider splitting by sample of origin for better smoothing
