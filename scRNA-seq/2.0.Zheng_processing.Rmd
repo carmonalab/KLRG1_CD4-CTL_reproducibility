@@ -1,0 +1,562 @@
+---
+title: "Zheng et al. Multi-cancer CD4 Data Processing"
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Overview
+
+This script downloads, loads, and processes the Zheng et al. 2021 pan-cancer T cell dataset
+for integration with the KLRG1 CD4-CTL reproducibility project. The script:
+
+1. Downloads raw data from Zenodo if needed
+2. Loads SCE objects and converts to Seurat format
+3. Performs QC filtering (ribosomal content, mitochondrial content, feature/count metrics)
+4. Standardizes gene symbols
+5. Saves the merged, high-quality object
+
+## Dataset Information
+
+- **Citation**: Zheng et al. (2021) - Pan-cancer single-cell landscape of tumor-infiltrating T cells
+- **Zenodo DOI**: https://zenodo.org/record/5461803
+- **Output**: `scRNA-seq/cache/Zheng_2021_34914499_whole.rds` (CD4+CD8 combined, high-quality cells)
+
+---
+
+# 0 - Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  echo = TRUE
+)
+```
+
+
+## Reproducible R environment (recommended)
+
+To reproduce the exact software environment used for this analysis,
+restore packages from the repository `renv.lock` file before running
+the pipeline.
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+## Load and attach packages
+
+```{r load_packages, message=FALSE}
+library(here)
+library(tidyverse)
+library(Seurat)
+library(SingleCellExperiment)
+library(STACAS)
+library(SignatuR)
+
+
+read_excel_allsheets <- function(filename) {
+  sheets <- openxlsx::getSheetNames(filename)
+  x <- lapply(sheets, function(sheet_name) {
+    openxlsx::read.xlsx(filename, sheet = sheet_name)
+  })
+  names(x) <- sheets
+  x
+}
+
+
+options(timeout = 4000) # increase timeout for downloading
+set.seed(321)
+```
+
+## Define parameters
+
+```{r define_parameters}
+# Dataset identifiers
+ds_name <- "Zheng_2021_34914499"
+dataset_id <- "ZheL"
+species <- "human"
+
+# QC filtering parameters
+min_cells_per_sample <- 200
+```
+
+## Set up data paths
+
+```{r setup_paths}
+# Reference gene annotations (for gene symbol standardization) from STACAS
+data("EnsemblGeneTable.Hs")
+
+# Data paths
+data_dir <- here("scRNA-seq", "cache")
+input_data_path <- file.path(data_dir, "Zheng_raw")
+
+# Create directories if needed
+dir.create(input_data_path, showWarnings = FALSE, recursive = TRUE)
+dir.create(data_dir, showWarnings = FALSE, recursive = TRUE)
+```
+
+# 1 - Download data
+
+## Zenodo download (skip if data already present)
+
+The data is downloaded from Zenodo (DOI: https://zenodo.org/record/5461803). 
+If already downloaded, this chunk is skipped.
+
+```{r download_zenodo, eval=FALSE}
+library(zen4R)
+
+# Create subdirectory for Zenodo data
+zenodo_dir <- file.path(input_data_path, "Zenodo")
+dir.create(zenodo_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Download if not already present
+if (length(list.files(zenodo_dir)) == 0) {
+  cat("Downloading Zheng dataset from Zenodo...\n")
+  zenodo_doi <- "10.5281/zenodo.5461803"
+  
+  zen4R::download_zenodo(doi = zenodo_doi, path = zenodo_dir)
+  
+  # Untar expression datasets and metadata
+  tar_zenodo_files <- list.files(zenodo_dir, "tar", full.names = TRUE) %>% 
+    grep("expression|meta", ., value = TRUE, ignore.case = TRUE)
+  
+  lapply(tar_zenodo_files, untar)
+  cat("Download complete.\n")
+} else {
+  cat("Data already present in", zenodo_dir, "\n")
+}
+```
+
+
+
+# 2 - Load data
+
+## Load SCE objects and convert to Seurat
+
+Zheng et al. provides SingleCellExperiment (SCE) objects with both CD4 and CD8 T cells 
+split by dataset. We load all available datasets and convert them to Seurat format,
+keeping only those with raw count data.
+
+```{r load_sce_objects}
+# Initialize lists to store file paths and metadata
+file_paths <- list()
+file_names <- list()
+dataset_names <- list()
+
+# Collect paths for CD4 and CD8 data
+for (cd_type in c("CD4", "CD8")) {
+  data_subdir <- file.path(input_data_path, "Zenodo", "expression", cd_type, "byDataset")
+  
+  if (!dir.exists(data_subdir)) {
+    warning("Directory not found: ", data_subdir)
+    next
+  }
+  
+  # Get all .rds files
+  file_paths[[cd_type]] <- list.files(
+    path = data_subdir,
+    pattern = "sce.rds$",
+    full.names = TRUE
+  )
+  
+  # Get file names (without .rds extension)
+  file_names[[cd_type]] <- list.files(
+    path = data_subdir,
+    pattern = "sce.rds$"
+  )
+  
+  # Dataset names (remove .sce.rds suffix)
+  dataset_names[[cd_type]] <- gsub(".sce.rds", "", file_names[[cd_type]])
+  
+  # Assign names to the file path vector
+  names(file_paths[[cd_type]]) <- dataset_names[[cd_type]]
+}
+
+cat("Found", length(file_paths$CD4), "CD4 datasets and", 
+    length(file_paths$CD8), "CD8 datasets\n")
+
+# Verify that CD4 and CD8 have matching dataset names
+if (!identical(dataset_names$CD4, dataset_names$CD8)) {
+  warning("Some datasets do not have both CD4 and CD8 samples")
+}
+
+# Load SCE objects and convert to Seurat
+# Keep only datasets with raw count data
+seurat_list <- list()
+
+for (dataset_name in dataset_names$CD4) {
+  seurat_list[[dataset_name]] <- list()
+  
+  for (cd_type in names(dataset_names)) {
+    sce <- readRDS(file_paths[[cd_type]][[dataset_name]])
+    
+    # Check for raw counts
+    if ("counts" %in% names(sce@assays)) {
+      # Convert SCE to Seurat (without normalized data slot)
+      seu <- as.Seurat(sce, data = NULL)
+      
+      # Rename assay from 'originalexp' to 'RNA' for consistency
+      seu <- RenameAssays(seu, originalexp = "RNA")
+
+      # Standardize gene symbols immediately after conversion to Seurat.
+      seu <- STACAS::StandardizeGeneSymbols(seu, EnsemblGeneTable.Hs)
+
+      # Rebuild the Seurat object so counts and metadata remain aligned
+      # after gene symbol standardization.
+      seu <- CreateSeuratObject(
+        counts = GetAssayData(seu, assay = "RNA", layer = "counts"),
+        meta.data = seu@meta.data,
+        assay = "RNA",
+        min.cells = 0,
+        min.features = 0
+      )
+      
+      # Add CD type to metadata
+      seu$cd_type <- cd_type
+      
+      seurat_list[[dataset_name]][[cd_type]] <- seu
+    } else {
+      cat(dataset_name, "for", cd_type, "does not have raw counts - skipping\n")
+    }
+  }
+}
+
+# Remove empty list elements
+keep_datasets <- names(seurat_list)[sapply(seurat_list, function(x) length(x) > 0)]
+seurat_list <- seurat_list[keep_datasets]
+
+cat("Loaded", length(seurat_list), "datasets with raw counts\n")
+```
+
+# 3 - Adapt and add metadata
+
+```{r adapt_meta}
+cohort_info_file <- file.path(input_data_path, "Zenodo", "cohort_patient_info.xlsx")
+clin_info_file <- file.path(
+  input_data_path,
+  "Zenodo",
+  "metaInfo",
+  "TableS1.clinicalInfo.P316.txt"
+)
+
+if (!file.exists(cohort_info_file)) {
+  stop("Missing cohort metadata file: ", cohort_info_file)
+}
+
+if (!file.exists(clin_info_file)) {
+  stop("Missing clinical metadata file: ", clin_info_file)
+}
+
+donor_info <- read_excel_allsheets(cohort_info_file) %>%
+  lapply(function(x) {
+    names(x) <- tolower(x[1, ])
+    x[-1, ]
+  })
+
+if ("Cohort Info" %in% names(donor_info)) {
+  names(donor_info$`Cohort Info`)[1] <- "cancerType"
+}
+
+clin_info <- read.table(
+  clin_info_file,
+  sep = "\t",
+  header = TRUE,
+  check.names = FALSE
+) %>%
+  distinct() %>%
+  separate(Patient.ID, into = c("dataset", "patient"), sep = "Study.", remove = FALSE)
+
+extract_barcode <- function(cell_name) {
+  pieces <- strsplit(as.character(cell_name), "_")[[1]]
+  if (length(pieces) >= 2) {
+    pieces[[2]]
+  } else {
+    sub("[.].*$", "", as.character(cell_name))
+  }
+}
+
+for (dataset_name in names(seurat_list)) {
+  for (cd_type in names(seurat_list[[dataset_name]])) {
+    tech <- NA_character_
+    if ("Cohort Info" %in% names(donor_info)) {
+      tech_idx <- donor_info$`Cohort Info`$dataset == dataset_name
+      if (any(tech_idx, na.rm = TRUE) && "technology" %in% names(donor_info$`Cohort Info`)) {
+        tech <- donor_info$`Cohort Info`[tech_idx, "technology"][[1]]
+      }
+    }
+
+    seu <- seurat_list[[dataset_name]][[cd_type]]
+    meta <- seu@meta.data
+
+    if (!"Original_cell_names" %in% names(meta)) {
+      meta$Original_cell_names <- colnames(seu)
+    }
+
+    if (!"patient" %in% names(meta)) {
+      meta$patient <- NA_character_
+    }
+
+    if (!"orig.ident" %in% names(meta)) {
+      meta$orig.ident <- dataset_name
+    }
+
+    if (!"batchV" %in% names(meta)) {
+      meta$batchV <- NA_character_
+    }
+
+    if (!"cellID.uniq" %in% names(meta)) {
+      meta$cellID.uniq <- colnames(seu)
+    }
+
+    meta <- meta %>%
+      mutate(
+        Original_cell_names = as.character(Original_cell_names),
+        orig.ident = as.character(orig.ident),
+        patient = as.character(patient),
+        batchV = as.character(batchV),
+        Barcode = vapply(Original_cell_names, extract_barcode, character(1)),
+        Study = ds_name,
+        dataset = dataset_name,
+        cd_type = cd_type,
+        Individual = patient,
+        Patient.ID = paste(dataset, patient, sep = "."),
+        Sample = paste(orig.ident, Patient.ID, batchV, sep = "_"),
+        cell_ids = paste(dataset_id, cellID.uniq, sep = "."),
+        technology = tech
+      ) %>%
+      rowwise() %>%
+      mutate(
+        time = ifelse(
+          grepl("-D", orig.ident),
+          strsplit(orig.ident, "-")[[1]][2],
+          NA_character_
+        ),
+        Treatment = ifelse(
+          grepl("pre|post", orig.ident, ignore.case = TRUE),
+          tail(strsplit(orig.ident, "[.]")[[1]], 1),
+          NA_character_
+        )
+      ) %>%
+      ungroup()
+
+    if (!grepl("this", dataset_name, ignore.case = TRUE)) {
+      meta <- meta %>%
+        mutate(
+          Patient.ID = gsub("LUNG[.]", "NSCLC.", Patient.ID),
+          Patient.ID = gsub("BC[.]", "BRCA.", Patient.ID),
+          Patient.ID = gsub("Peter2018", "PeterSavas", Patient.ID),
+          Patient.ID = gsub("ZiyiLi10X", "LeiZhang2020", Patient.ID),
+          Patient.ID = gsub("YaoHe10X", "QimingZhang2019.10X", Patient.ID),
+          Patient.ID = gsub("Melanoma", "MELA", Patient.ID),
+          Patient.ID = gsub("XiliangWang2019", "YangLiu2020", Patient.ID),
+          Patient.ID = gsub("Elham2018", "ElhamAzizi2018", Patient.ID),
+          Patient.ID = gsub("Indrop", "InDrop", Patient.ID),
+          Patient.ID = gsub("zhangLabSS2[.]CRC", "LeiZhang2018.CRC", Patient.ID),
+          Patient.ID = gsub("LeiZhang2020", "LeiZhang2020.10X", Patient.ID),
+          Patient.ID = gsub("zhangLabSS2[.]HCC", "ChunhongZheng2017.HCC", Patient.ID),
+          Patient.ID = gsub("YaoHeSS2", "QimingZhang2019.SS2", Patient.ID),
+          Patient.ID = gsub("129p[a|b]", "129", Patient.ID),
+          Patient.ID = gsub("zhangLabSS2[.]NSCLC", "XinyiGuo2018.LUNG", Patient.ID)
+        ) %>%
+        left_join(clin_info[, -c(2:7)], by = "Patient.ID") %>%
+        distinct() %>%
+        tibble::column_to_rownames(var = "cell_ids")
+    } else {
+      meta <- meta %>%
+        left_join(clin_info[, -c(1, 2, 4:7)], by = "patient") %>%
+        distinct() %>%
+        tibble::column_to_rownames(var = "cell_ids")
+    }
+
+    seu <- RenameCells(seu, new.names = rownames(meta))
+    seu@meta.data <- meta
+    seurat_list[[dataset_name]][[cd_type]] <- seu
+  }
+}
+```
+
+# 4 - Merge datasets
+
+```{r merge_objects}
+# Flatten the nested dataset/CD4-CD8 structure before merging.
+seurat_objects <- unlist(seurat_list, recursive = FALSE)
+
+if (length(seurat_objects) == 0) {
+  stop("No Seurat objects were loaded from the Zheng dataset.")
+}
+
+merged_seu <- Reduce(
+  f = function(x, y) merge(x, y),
+  x = seurat_objects
+)
+
+individual_metadata <- merged_seu@meta.data %>%
+  tibble::rownames_to_column(var = "cell_id") %>%
+  distinct(
+    Patient.ID,
+    cancerType,
+    Age,
+    Gender,
+    pTNM,
+    Clinical.Stage,
+    BMI,
+    Lymphocyte.count..10e9.L.
+  )
+
+merged_seu@misc$batch.metadata <- list()
+merged_seu@misc$batch.metadata$Individual <- individual_metadata
+
+cat("Merged object has", ncol(merged_seu), "cells and", 
+    nrow(merged_seu), "genes\n")
+```
+
+
+
+
+
+# 5 - Quality Control and Filtering
+
+## Calculate QC metrics
+
+```{r calculate_qc_metrics}
+library(SignatuR)
+
+# Get mitochondrial and ribosomal gene signatures
+mito_genes <- GetSignature(SignatuR$Hs$Compartments$Mito)
+ribo_genes <- GetSignature(SignatuR$Hs$Compartments$Ribo)
+
+# Add QC metrics to metadata
+merged_seu <- AddMetaData(
+  merged_seu,
+  metadata = PercentageFeatureSet(
+    merged_seu,
+    features = mito_genes[mito_genes %in% rownames(merged_seu)]
+  ),
+  col.name = "percent_mito"
+)
+
+merged_seu <- AddMetaData(
+  merged_seu,
+  metadata = PercentageFeatureSet(
+    merged_seu,
+    features = ribo_genes[ribo_genes %in% rownames(merged_seu)]
+  ),
+  col.name = "percent_ribo"
+)
+
+# Add sequencing complexity metric
+merged_seu$log10_genes_per_umi <- log10(merged_seu$nFeature_RNA) / log10(merged_seu$nCount_RNA)
+
+cat("QC metrics calculated\n")
+```
+
+## Visualize QC metrics before filtering
+
+```{r qc_violin, fig.height=10, fig.width=12}
+# Set sample identity for visualization
+Idents(merged_seu) <- "orig.ident"
+
+# Violin plot of QC metrics
+VlnPlot(
+  merged_seu,
+  features = c("nFeature_RNA", "nCount_RNA", "percent_mito", "percent_ribo"),
+  ncol = 2,
+  pt.size = 0
+)
+```
+
+## QC filtering
+
+Apply standard QC thresholds:
+
+```{r qc_filter}
+# Store initial cell count
+n_cells_initial <- ncol(merged_seu)
+
+# Define QC thresholds
+qc_thresholds <- list(
+  nFeature_RNA = c(min = 400, max = 6000),
+  nCount_RNA = c(min = 800, max = 40000),
+  percent_mito = c(min = 0, max = 20),
+  percent_ribo = c(min = 0, max = 60),
+  log10_genes_per_umi = 0.7
+)
+
+# Apply filtering
+merged_seu <- subset(
+  merged_seu,
+  subset = 
+    nFeature_RNA >= qc_thresholds$nFeature_RNA["min"] &
+    nFeature_RNA < qc_thresholds$nFeature_RNA["max"] &
+    nCount_RNA >= qc_thresholds$nCount_RNA["min"] &
+    nCount_RNA < qc_thresholds$nCount_RNA["max"] &
+    percent_mito >= qc_thresholds$percent_mito["min"] &
+    percent_mito < qc_thresholds$percent_mito["max"] &
+    percent_ribo >= qc_thresholds$percent_ribo["min"] &
+    percent_ribo < qc_thresholds$percent_ribo["max"] &
+    log10_genes_per_umi > qc_thresholds$log10_genes_per_umi
+)
+
+n_cells_filtered <- ncol(merged_seu)
+pct_retained <- 100 * n_cells_filtered / n_cells_initial
+
+cat("QC filtering complete\n")
+cat("Initial cells:", n_cells_initial, "\n")
+cat("Filtered cells:", n_cells_filtered, "\n")
+cat("Retained:", sprintf("%.1f%%", pct_retained), "\n")
+```
+
+## Remove small samples
+
+```{r remove_small_samples}
+# Remove samples with fewer than minimum cells
+tab <- table(merged_seu$orig.ident)
+keep_samples <- names(tab)[tab > min_cells_per_sample]
+
+n_samples_before <- length(unique(merged_seu$orig.ident))
+merged_seu <- subset(merged_seu, orig.ident %in% keep_samples)
+n_samples_after <- length(unique(merged_seu$orig.ident))
+
+cat("Samples before:", n_samples_before, "\n")
+cat("Samples after (removed small samples):", n_samples_after, "\n")
+cat("Total cells:", ncol(merged_seu), "\n")
+```
+
+## Normalize data
+
+```{r normalize_data}
+merged_seu <- NormalizeData(merged_seu)
+cat("Data normalized\n")
+```
+
+---
+
+# 6 - Save processed object
+
+```{r save_object}
+# Save the merged, filtered, standardized object
+output_file <- file.path(data_dir, paste0(ds_name, "_whole.rds"))
+saveRDS(merged_seu, output_file)
+cat("Processed Zheng object saved to:", output_file, "\n")
+cat("Final object dimensions:", nrow(merged_seu), "genes x", ncol(merged_seu), "cells\n")
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```
+
