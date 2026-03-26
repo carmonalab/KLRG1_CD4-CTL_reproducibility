@@ -1,0 +1,225 @@
+---
+title: "GeoMx Spatial — CD4 Spots Deconvolution"
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Overview
+
+Computes cell-type signature scores in GeoMx CD4 spots using marker genes derived from single-cell data, then visualizes the scores by spatial metadata.
+
+Notes:
+- This notebook requires two inputs:
+  - The GeoMx cache produced by `GeoMx_spatial/1.Data_processing.Rmd` (saved as `GeoMx_spatial/cache/GeoMx_rawdata_metadata.rds`).
+  - The integrated Seurat object `int` produced in `scRNA-seq/1.1.Data_processing.Rmd` + `scRNA-seq/1.2.Integration_annotation.Rmd` (saved as `scRNA-seq/cache/cd4_total_integrated_manual.rds`).
+
+---
+
+# 0 — Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Reproducible R environment (recommended)
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+```{r packages}
+library(here)
+library(tidyverse)
+library(Seurat)
+# Signature scoring
+library(UCell)
+library(ggpubr)
+```
+
+```{r paths}
+geomx_cache <- here::here("GeoMx_spatial", "cache", "GeoMx_rawdata_metadata.rds")
+sc_cache <- here::here("scRNA-seq", "cache")
+int_path <- file.path(sc_cache, "cd4_total_integrated_manual.rds")
+```
+
+---
+
+# 1 — Load GeoMx cache and scRNA-seq object
+
+```{r load-inputs}
+if (!file.exists(geomx_cache)) {
+  stop("Missing GeoMx cache: ", geomx_cache, "\nRun GeoMx_spatial/1.Data_processing.Rmd first.")
+}
+geomx <- readRDS(geomx_cache)
+rawdata <- geomx$rawdata
+metadata <- geomx$metadata
+stopifnot(!is.null(rawdata), !is.null(metadata))
+
+if (!file.exists(int_path)) {
+  stop(
+    "Missing integrated scRNA-seq object: ", int_path,
+    "\nRun scRNA-seq/1.2.Integration_annotation.Rmd first."
+  )
+}
+int <- readRDS(int_path)
+```
+
+---
+
+# 2 — Derive markers from scRNA-seq (TILN only)
+
+This mirrors the reference workflow:
+
+- Use `FindAllMarkers()` on `int` restricted to `tissue == "TILN"` to match the spatial data
+- Keep strong positive markers per cluster
+- Select up to 10 marker genes per cluster
+
+```{r derive-markers}
+Idents(int) <- "annotation"
+
+if (!"tissue" %in% colnames(int@meta.data)) {
+  stop("Expected 'tissue' column missing in int@meta.data")
+}
+
+de_all0 <- FindAllMarkers(
+  int[, int$tissue == "TILN"],
+  assay = "RNA",
+  logfc.threshold = 0.25,
+  test.use = "bimod",
+  only.pos = TRUE,
+  min.pct = 0.4,
+  min.diff.pct = 0.1
+)
+
+de_all <- de_all0 %>%
+  filter(
+    p_val_adj < 0.05,
+    avg_log2FC > 0.4,
+    !grepl("^HLA|^RPS", gene) # remove HLA and ribosomal genes
+  ) %>%
+  mutate(
+    dif.pct = pct.1 - pct.2,
+    ppct = dif.pct / pct.1
+  ) %>%
+  arrange(cluster, desc(dif.pct))
+
+# Choose best markers for each cell type
+split_markers <- split(de_all, de_all$cluster)
+for (cl in names(split_markers)) {
+  split_markers[[cl]] <- split_markers[[cl]] %>%
+    arrange(desc(ppct)) %>%
+    filter(!grepl("^MIR", gene))
+
+  if (nrow(split_markers[[cl]]) > 10) {
+    split_markers[[cl]] <- split_markers[[cl]][1:10, ]
+  }
+
+  split_markers[[cl]] <- split_markers[[cl]] %>% pull(gene)
+}
+
+# Show marker set sizes
+tibble(
+  celltype = names(split_markers),
+  n_genes = vapply(split_markers, length, integer(1))
+)
+```
+
+---
+
+# 3 — Score signatures in GeoMx spots (UCell)
+
+```{r score-ucell}
+# rawdata is genes x spots
+u_scores <- ScoreSignatures_UCell(
+  matrix = rawdata,
+  features = split_markers,
+  ncores = 4,
+  name = ""
+)
+
+u_scores <- u_scores %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Spot") %>%
+  pivot_longer(-Spot, names_to = "Celltype", values_to = "Score")
+```
+
+---
+
+# 4 — Plot signature scores by GeoMx metadata
+
+```{r deconvolution-boxplot}
+if (!all(c("Type", "B_dist") %in% colnames(metadata))) {
+  stop("Expected metadata columns missing: need at least Type and B_dist")
+}
+
+res_u <- metadata %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Spot") %>%
+  right_join(u_scores, by = "Spot") %>%
+  filter(
+    Type == "CD4",
+    !is.na(B_dist)
+  )
+
+# Match reference example: Cytotoxic + TFH
+res_u2 <- res_u %>%
+  filter(Celltype %in% c("Cytotoxic", "TFH"))
+
+the <- theme(
+  legend.title = element_text(size = 16, face = "bold"),
+  axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+)
+
+bdist <- res_u2 %>%
+  mutate(B_dist = factor(B_dist, levels = c("close", "far"))) %>%
+  ggplot(aes(Celltype, Score)) +
+  geom_point(
+    aes(color = Patient, group = B_dist),
+    position = position_jitterdodge(jitter.width = 0.2, dodge.width = 1),
+    alpha = 0.5,
+    show.legend = TRUE
+  ) +
+  geom_boxplot(
+    aes(fill = B_dist),
+    color = "black",
+    alpha = 0.3,
+    outlier.shape = NA,
+    position = position_dodge(1)
+  ) +
+  scale_fill_manual(values = c(
+    "close" = "#6C8EBF",
+    "far" = "#B07C59"
+  )) +
+  ggpubr::stat_compare_means(
+    aes(group = B_dist),
+    method = "wilcox.test",
+    label = "p.format",
+    p.adjust.method = "BH",
+    size = 3,
+    tip.length = 0,
+    bracket.size = 0.8
+  ) +
+  labs(fill = "Distance to B cells", y = "Signature Score") +
+  facet_wrap(~Localisation) +
+  ggpubr::theme_classic2() +
+  the
+
+bdist
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
