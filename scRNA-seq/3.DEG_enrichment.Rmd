@@ -410,7 +410,7 @@ enrich_plot
 
 ## Collect log2FC vector for node annotation
 
-```{r}
+```{r string-lfc}
 lfc_vec <- de %>%
   dplyr::select(gene, log2FoldChange) %>%
   distinct() %>%
@@ -418,11 +418,11 @@ lfc_vec <- de %>%
 ```
 
 
-### Pick adhesion-related UP genes from GO enrichment
+## Pick adhesion-related UP genes from GO enrichment
 First, subset GO terms that are adhesion-related, then extract the contributing genes.
 This ensures the network is functionally grounded in the GO results, not just arbitrary DE genes.
 
-```{r}
+```{r string-adhesion-genes}
 # identify adhesion-related GO terms
 adhesion_terms <- ego_res %>%
   filter(grepl("adhesion|cell adhesion|cell-cell", 
@@ -441,9 +441,9 @@ adhesion_genes <- intersect(adhesion_genes, selectedEntrezsUP)
 genes_for_network <- unique(c("KLRG1", adhesion_genes))
 ```
 
-### Query STRING for interaction data
+## Query STRING for interaction data
 
-```{r}
+```{r string-query}
 library(STRINGdb)
 
 string_db <- STRINGdb$new(
@@ -481,9 +481,9 @@ mapped_klrg1 <- mapped %>%
   filter(STRING_id %in% connected_ids)
 ```
 
-### Build graph object
+## Build graph object
 
-```{r}
+```{r string-igraph}
 library(igraph)
 valid_ids <- mapped_klrg1$STRING_id
 
@@ -509,11 +509,13 @@ g <- graph_from_data_frame(
 )
 ```
 
-### Render plot
+## Render plot
 string-like interaction map with KLRG1 highlighted.
 combined_score is STRING’s overall confidence score for a protein–protein interaction.
 
-```{r}
+Corresponding to Suppl Fig 3A
+
+```{r string-plot, fig.width=7, fig.height=5}
 library(ggraph)
 library(ggplot2)
 
