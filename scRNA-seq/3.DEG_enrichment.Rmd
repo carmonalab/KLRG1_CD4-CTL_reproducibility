@@ -1,6 +1,6 @@
 ---
 title: "3 — DEG analysis: PBMC KLRG1+ vs KLRG1− CD4 T cells"
-author: ""
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
 date: "`r Sys.Date()`"
 output:
   html_document:
