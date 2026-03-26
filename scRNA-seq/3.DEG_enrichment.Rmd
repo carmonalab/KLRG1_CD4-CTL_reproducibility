@@ -1,0 +1,596 @@
+---
+title: "3 — DEG analysis: PBMC KLRG1+ vs KLRG1− CD4 T cells"
+author: ""
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+## Input
+
+- `scRNA-seq/cache/cd4_total_integrated_manual.rds` — Seurat object produced by
+  `scRNA-seq/1.1.Integration_annotation.Rmd`. Contains all integrated CD4 T cells
+  with columns `patient`, `tissue`, `annotation`, and `KLRG1_expression`
+  (KLRG1+/KLRG1−) added in section 9.3 of that script.
+
+## Output
+
+- `scRNA-seq/cache/DEG_Pseudobulk_PBMC_KLRG1_POS_vs_KLRG1_NEG.rds` — DESeq2
+  results data frame
+
+---
+
+# 0 — Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 7
+)
+```
+
+## Reproducible R environment (recommended)
+
+To reproduce the exact software environment used for this analysis,
+restore packages from the repository `renv.lock` file before running
+the pipeline.
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+```{r packages}
+library(Seurat)
+library(tidyverse)
+library(DESeq2)
+library(ggrepel)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(msigdbr)
+library(STRINGdb)
+library(igraph)
+library(ggraph)
+library(here)
+```
+
+```{r paths}
+cache_dir <- here::here("scRNA-seq", "cache")
+in_rds    <- file.path(cache_dir, "cd4_total_integrated_manual.rds")
+
+if (!file.exists(in_rds)) {
+  stop("Input not found: ", in_rds,
+       "\nRun scRNA-seq/1.1.Integration_annotation.Rmd first.")
+}
+```
+
+---
+
+# 1 — Load data
+
+```{r load-data}
+int <- readRDS(in_rds)
+DefaultAssay(int) <- "RNA"
+
+cat("Cells loaded:", ncol(int), "\n")
+cat("Patients:    ", n_distinct(int$patient), "\n")
+print(table(int$tissue, useNA = "ifany"))
+
+# Ensure KLRG1_expression is present (added in 1.1 section 9.3)
+if (!"KLRG1_expression" %in% colnames(int@meta.data)) {
+  stop(
+    "Column 'KLRG1_expression' not found in the loaded object.\n",
+    "Re-run 1.1.Integration_annotation.Rmd (section 9.3) to add it."
+  )
+}
+```
+
+---
+
+# 2 — PBMC subset
+
+```{r pbmc-subset}
+cd4.pbmc <- int[, int$tissue == "PBMC"]
+cat("PBMC cells:", ncol(cd4.pbmc), "\n")
+print(table(cd4.pbmc$KLRG1_expression, cd4.pbmc$patient))
+```
+
+## Cell-count bar chart per patient
+
+```{r pbmc-cell-counts, fig.width=10, fig.height=5}
+props <- cd4.pbmc@meta.data %>%
+  dplyr::count(patient, KLRG1_expression) %>%
+  dplyr::rename(Number_cells = n) %>%
+  mutate(KLRG1_expression = factor(KLRG1_expression,
+                                   levels = c("KLRG1+", "KLRG1-")))
+
+ggplot(props, aes(patient, Number_cells, fill = KLRG1_expression)) +
+  geom_col() +
+  scale_fill_manual(values = c("KLRG1+" = "#0072B2", "KLRG1-" = "#D55E00")) +
+  labs(
+    x = "Patient",
+    y = "Number of cells",
+    fill = "KLRG1 status",
+    title = "PBMC CD4 T cells — KLRG1+ vs KLRG1− per patient"
+  ) +
+  ggpubr::theme_classic2() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+# 3 — Pseudobulk aggregation
+
+```{r pseudobulk-aggregate}
+# Remove patients with very few cells in either compartment
+min_cells_thresh <- 10
+keep_patients <- cd4.pbmc@meta.data %>%
+  dplyr::count(patient, KLRG1_expression) %>%
+  group_by(patient) %>%
+  filter(all(n >= min_cells_thresh)) %>%
+  pull(patient) %>%
+  unique()
+
+cat("Patients retained for pseudobulk:", length(keep_patients), "\n")
+cat(paste(" -", keep_patients, collapse = "\n"), "\n")
+
+cd4.pbmc.filt <- cd4.pbmc[, cd4.pbmc$patient %in% keep_patients]
+
+bu <- AggregateExpression(
+  cd4.pbmc.filt,
+  assays = "RNA",
+  slot   = "counts",
+  group.by = c("patient", "KLRG1_expression")
+)[["RNA"]]
+
+cat("Pseudobulk matrix dimensions:", nrow(bu), "genes ×", ncol(bu), "samples\n")
+```
+
+---
+
+# 4 — DESeq2
+
+## Build DESeq2 dataset
+
+```{r deseq2-build}
+# Remove TCR variable/diversity/joining genes (patient-specific)
+trs <- grep("^TR[ABGD][VDJ]", rownames(bu), value = TRUE)
+bu  <- bu[!rownames(bu) %in% trs, ]
+
+# Build sample metadata from aggregated column names
+# Column format: <patient>_<KLRG1_expression>
+# KLRG1+ → KLRG1_POS ; KLRG1- → KLRG1_NEG (DESeq2 forbids special characters)
+metadata <- data.frame(
+  row.names = colnames(bu),
+  Patient = sub("_KLRG1.*$", "", colnames(bu)),
+  KLRG1_expression = sub("^.*_(KLRG1.*)$", "\\1", colnames(bu))
+) %>%
+  mutate(
+    KLRG1_expression = gsub("[+]", "_POS", KLRG1_expression),
+    KLRG1_expression = gsub("-",   "_NEG", KLRG1_expression),
+    KLRG1_expression = factor(KLRG1_expression,
+                              levels = c("KLRG1_NEG", "KLRG1_POS"))
+  )
+
+print(metadata)
+
+dds <- DESeq2::DESeqDataSetFromMatrix(
+  countData = bu,
+  colData   = metadata,
+  design    = ~ Patient + KLRG1_expression
+)
+
+# Remove genes with very low counts
+dds <- dds[rowSums(counts(dds)) > 20, ]
+cat("Genes after low-count filter:", nrow(dds), "\n")
+```
+
+## Quality control: PCA
+
+```{r deseq2-pca}
+dds <- estimateSizeFactors(dds)
+vsd <- vst(dds, blind = TRUE)
+plotPCA(vsd, intgroup = "KLRG1_expression") +
+  ggtitle("PCA — pseudobulk PBMC KLRG1+/−")
+```
+
+## Differential expression
+
+```{r deseq2-run}
+dds <- DESeq(dds)
+print(resultsNames(dds))
+
+# Robustly select the KLRG1_POS vs KLRG1_NEG coefficient
+klrg1_coef <- grep("KLRG1_POS", resultsNames(dds), value = TRUE)
+cat("Using coefficient:", klrg1_coef, "\n")
+
+res <- lfcShrink(dds, coef = klrg1_coef, type = "apeglm")
+
+res_df <- as.data.frame(res) %>%
+  tibble::rownames_to_column("gene") %>%
+  arrange(padj)
+
+cat("Significant DEGs (|log2FC| > log2(1.5), padj < 0.05):",
+    sum(abs(res_df$log2FoldChange) >= log2(1.5) & res_df$padj < 0.05,
+        na.rm = TRUE), "\n")
+
+head(res_df, 20)
+```
+
+---
+
+# 5 — Volcano plot: PBMC KLRG1+ vs KLRG1−
+
+Corresponding to Figure 2B
+
+```{r volcano, fig.width=13, fig.height=10}
+fc  <- 1.5
+fdr <- 0.05
+
+pseudolog10 <- function(x) {
+  sign(x) * log10(abs(x) + 1)
+}
+
+pseudolog10_breaks <- c(-16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16)
+pseudolog10_labels <- as.character(pseudolog10_breaks)
+
+cytotox_genes <- c("CST7", "GNLY", "NKG7", "GZMA", "GZMB", "GZMH", "GZMK", "PRF1")
+
+vol_data <- res_df %>%
+  mutate(
+    Spec = ifelse(gene %in% cytotox_genes, "Relevant cytotoxic gene", "Other"),
+    padj = ifelse(is.na(padj), 1, padj)
+  ) %>%
+  transmute(
+    log2FC = log2FoldChange,
+    sig    = -log10(padj),
+    log2FC_pseudo = pseudolog10(log2FoldChange),
+    sig_pseudo    = pseudolog10(-log10(padj)),
+    gene,
+    Spec
+  )
+
+set.seed(22)
+vol_plot <- vol_data %>%
+  ggplot(aes(x = log2FC_pseudo, y = sig_pseudo, color = Spec, label = gene)) +
+  geom_point(size = 2, alpha = 0.95, show.legend = TRUE) +
+  geom_vline(xintercept = pseudolog10(c(-log2(fc), log2(fc))),
+             linetype = 2, linewidth = 0.3, col = "grey50") +
+  geom_hline(yintercept = pseudolog10(-log10(fdr)),
+             linetype = 2, linewidth = 0.3, col = "grey50") +
+  ggrepel::geom_text_repel(
+    data = subset(vol_data,
+                  sig >= -log10(fdr) & abs(log2FC) >= log2(fc) &
+                    Spec != "Relevant cytotoxic gene"),
+    size = 4, fontface = "italic", max.overlaps = 5
+  ) +
+  ggrepel::geom_label_repel(
+    aes(label = ifelse(Spec == "Relevant cytotoxic gene", gene, NA)),
+    color = "white", fill = "#3B75AF", fontface = "italic",
+    na.rm = TRUE
+  ) +
+  scale_color_manual(values = c("Other" = "grey30",
+                                "Relevant cytotoxic gene" = "#3B75AF")) +
+  scale_x_continuous(
+    breaks = pseudolog10(pseudolog10_breaks),
+    labels = pseudolog10_labels,
+    name = "log2 Fold Change"
+  ) +
+  scale_y_continuous(
+    breaks = pseudolog10(c(0, 1, 2, 4, 8, 16, 32, 64, 128, 256)),
+    labels = c("0", "1", "2", "4", "8", "16", "32", "64", "128", "256"),
+    name = "-log10 adj. p-value"
+  ) +
+  labs(
+    color = "Gene type",
+    title = "PBMC KLRG1+ vs KLRG1−  (pseudobulk DESeq2)"
+  ) +
+  ggpubr::theme_classic2() +
+  theme(
+    legend.title = element_text(size = 16, face = "bold"),
+    legend.text  = element_text(size = 13),
+    axis.title   = element_text(size = 14),
+    plot.title   = element_text(size = 16, face = "bold")
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 4)))
+
+vol_plot
+```
+
+---
+
+# 6 — Export DEG table
+
+```{r export-deg}
+out_rds   <- file.path(cache_dir, "DEG_Pseudobulk_PBMC_KLRG1_POS_vs_KLRG1_NEG.rds")
+out_excel <- file.path(cache_dir,  "DEG_Pseudobulk_PBMC_KLRG1_POS_vs_KLRG1_NEG.xlsx")
+
+saveRDS(res_df, out_rds)
+openxlsx::write.xlsx(
+  x = res_df,
+  file = out_excel,
+  sheetName = "DEG",
+  overwrite = TRUE
+)
+
+cat("DEG table saved:\n  ", out_rds, "\n  ", out_excel, "\n")
+```
+
+---
+
+# 7 — GO enrichment (GOBP)
+
+## Prepare gene lists
+
+```{r go-prep}
+de <- res_df
+
+allEntrezs <- de$gene
+
+selectedEntrezsUP <- de %>%
+  filter(log2FoldChange > 0 & padj < 0.05) %>%
+  pull(gene)
+
+selectedEntrezsDOWN <- de %>%
+  filter(log2FoldChange < 0 & padj < 0.05) %>%
+  pull(gene)
+
+# Signed -log10(p) metric for ranked enrichment
+selectedEntrezs <- de %>%
+  filter(!is.na(log2FoldChange)) %>%
+  mutate(
+    fcsign = sign(log2FoldChange),
+    logP   = -log10(pvalue),
+    metric = logP / fcsign
+  ) %>%
+  arrange(desc(metric)) %>%
+  pull(metric, name = gene)
+
+selectedEntrezs <- sort(selectedEntrezs, decreasing = TRUE)
+
+cat("UP-regulated DEGs (padj < 0.05):  ", length(selectedEntrezsUP), "\n")
+cat("DOWN-regulated DEGs (padj < 0.05):", length(selectedEntrezsDOWN), "\n")
+```
+
+## Load GOBP gene sets (MSigDB)
+
+```{r go-load-msigdb}
+m_df0 <- msigdbr(species = "Homo sapiens") %>%
+  dplyr::filter(gs_collection == "C5" & grepl("^GOBP_", gs_name)) %>%
+  as.data.frame()
+
+m_df <- m_df0[, c("gs_name", "gene_symbol")]
+
+m_df2 <- m_df0 %>%
+  distinct(gs_name, gs_description, gs_collection, gs_subcollection) %>%
+  dplyr::rename(ID = gs_name)
+```
+
+## GO enrichment — upregulated genes
+
+Corresponding to Figure 3A
+
+Slight differences possible due to different package versions, but overall very similar results.
+
+```{r go-up, fig.width=9, fig.height=9}
+pth <- 0.05
+
+ego <- enricher(
+  selectedEntrezsUP,
+  TERM2GENE      = m_df,
+  universe       = allEntrezs,
+  pAdjustMethod  = "fdr",
+  pvalueCutoff   = pth
+)
+
+ego_res <- ego@result %>%
+  filter(p.adjust < pth) %>%
+  left_join(m_df2, by = "ID")
+
+enrich_plot <- dotplot(ego,
+                       showCategory = 20,
+                       title = "UPREGULATED in KLRG1+ (PBMC)") +
+  scale_color_gradientn(colours = c("#C65A5A", "#9C8797", "#2F6FA3")) +
+  geom_point(alpha = 0.8, shape = 21, color = "black")
+
+enrich_plot
+```
+
+---
+
+# 8 — STRING interaction network
+
+## Collect log2FC vector for node annotation
+
+```{r}
+lfc_vec <- de %>%
+  dplyr::select(gene, log2FoldChange) %>%
+  distinct() %>%
+  tibble::deframe()
+```
+
+
+### Pick adhesion-related UP genes from GO enrichment
+First, subset GO terms that are adhesion-related, then extract the contributing genes.
+This ensures the network is functionally grounded in the GO results, not just arbitrary DE genes.
+
+```{r}
+# identify adhesion-related GO terms
+adhesion_terms <- ego_res %>%
+  filter(grepl("adhesion|cell adhesion|cell-cell", 
+               Description, ignore.case = TRUE))
+
+# extract genes contributing to those terms
+adhesion_genes <- adhesion_terms %>%
+  separate_rows(geneID, sep = "/") %>%
+  distinct(geneID) %>%
+  pull(geneID)
+
+# keep only upregulated genes
+adhesion_genes <- intersect(adhesion_genes, selectedEntrezsUP)
+
+# add KLRG1 explicitly
+genes_for_network <- unique(c("KLRG1", adhesion_genes))
+```
+
+### Query STRING for interaction data
+
+```{r}
+library(STRINGdb)
+
+string_db <- STRINGdb$new(
+  version = "11.5",
+  species = 9606,
+  score_threshold = 400,
+  input_directory = ""
+)
+
+# map gene symbols to STRING IDs
+mapped <- string_db$map(
+  data.frame(gene = genes_for_network),
+  "gene",
+  removeUnmappedRows = TRUE
+)
+
+# retrieve interaction network
+string_edges <- string_db$get_interactions(mapped$STRING_id)
+
+# get STRING ID for KLRG1
+klrg1_string_id <- mapped %>%
+  filter(gene == "KLRG1") %>%
+  pull(STRING_id)
+
+# keep only edges directly connected to KLRG1
+string_edges_klrg1 <- string_edges %>%
+  filter(from == klrg1_string_id | to == klrg1_string_id)
+
+connected_ids <- unique(c(
+  string_edges_klrg1$from,
+  string_edges_klrg1$to
+))
+
+mapped_klrg1 <- mapped %>%
+  filter(STRING_id %in% connected_ids)
+```
+
+### Build graph object
+
+```{r}
+library(igraph)
+valid_ids <- mapped_klrg1$STRING_id
+
+edges <- string_edges_klrg1 %>%
+  dplyr::filter(
+    from %in% valid_ids &
+    to   %in% valid_ids
+  ) %>%
+  dplyr::select(from, to, combined_score)
+
+nodes <- mapped_klrg1 %>%
+  transmute(
+    name = STRING_id,      # IMPORTANT
+    gene = gene,
+    log2FC = lfc_vec[gene],
+    is_klrg1 = gene == "KLRG1"
+  )
+
+g <- graph_from_data_frame(
+  d = edges,
+  vertices = nodes,
+  directed = FALSE
+)
+```
+
+### Render plot
+string-like interaction map with KLRG1 highlighted.
+combined_score is STRING’s overall confidence score for a protein–protein interaction.
+
+```{r}
+library(ggraph)
+library(ggplot2)
+
+set.seed(22)
+
+gplot <- ggraph(g, layout = "fr") +
+
+  ## edges: subtle, curved, confidence-weighted
+  geom_edge_link(
+    aes(width = combined_score),
+    alpha = 0.35,
+    color = "grey65",
+    lineend = "round"
+  ) +
+
+  ## nodes: size = |log2FC|, KLRG1 emphasized
+  geom_node_point(
+    aes(
+      size = abs(log2FC),
+      fill = is_klrg1
+    ),
+    shape = 21,
+    color = "black",
+    stroke = 0.4
+  ) +
+
+  ## labels with halo for readability
+  geom_node_text(
+    aes(label = gene),
+    repel = TRUE,
+    size = 3.2,
+    family = "sans",
+    color = "black",
+    bg.color = "white",
+    bg.r = 0.15
+  ) +
+
+  ## scales
+  scale_size_continuous(
+    name = "|log2FC|",
+    range = c(3, 10)
+  ) +
+
+  scale_fill_manual(
+    values = c(`FALSE` = "#4C72B0",   # muted blue
+               `TRUE`  = "#C44E52"),  # muted red
+    labels = c("Adhesion-related genes", "KLRG1"),
+    name = ""
+  ) +
+
+  scale_edge_width(
+    range = c(0.3, 1.2),
+    guide = "none"
+  ) +
+
+  ## theme tweaks
+  theme_void() +
+  theme(
+    plot.title = element_text(
+      hjust = 0.5,
+      size = 12,
+      face = "bold"
+    ),
+    legend.position = "right",
+    legend.text = element_text(size = 9),
+    legend.title = element_text(size = 9)
+  ) +
+
+  ggtitle("KLRG1-centered adhesion interaction network")
+
+gplot
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
