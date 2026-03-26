@@ -1,0 +1,228 @@
+---
+title: "scRNA-seq Custom Genes Expression — Cenerenti et al."
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+---
+
+# Overview
+
+This script loads the integrated/annotated Seurat object generated in
+`1.1.Integration_annotation.Rmd` and measures the **IFN and MX1 expression**
+using a pseudobulk per patient and tissue approach.
+
+---
+
+# 0 — Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Reproducible R environment (recommended)
+
+To reproduce the exact software environment used for this analysis,
+restore packages from the repository `renv.lock` file before running
+the notebook.
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+```{r packages}
+library(Seurat)   # >= 4.0
+library(Matrix)
+library(ggplot2)
+library(ggpubr)
+library(tidyverse)
+```
+
+```{r paths}
+# All outputs are written here; the directory already exists in the repo.
+cache_dir <- here::here("scRNA-seq", "cache")
+```
+
+```{r helpers}
+Log_Normalize <- function(mat,
+                          total.counts,
+                          scale.factor = 1e4,
+                          margin = 2L) {
+  stopifnot(inherits(mat, "dgCMatrix"))
+  if (missing(total.counts) || is.null(total.counts)) {
+    stop("`total.counts` must be provided")
+  }
+
+  margin <- as.integer(margin)
+  if (!margin %in% c(1L, 2L)) stop("`margin` must be 1 (rows) or 2 (cols)")
+
+  ids <- if (margin == 2L) colnames(mat) else rownames(mat)
+  if (is.null(ids)) stop("Matrix must have row/col names for the chosen `margin`")
+
+  total.counts <- total.counts[ids]
+  if (anyNA(total.counts)) stop("`total.counts` is missing entries for some ids")
+  if (any(total.counts <= 0)) stop("`total.counts` must be > 0 for all ids")
+
+  if (margin == 2L) {
+    mat <- Matrix::t(Matrix::t(mat) / total.counts)
+  } else {
+    mat <- mat / total.counts
+  }
+
+  mat@x <- log1p(mat@x * scale.factor)
+  mat
+}
+```
+
+# 1 — Load integrated object (from 1.1)
+
+```{r load-integrated}
+library(here)
+int_path <- file.path(cache_dir, "cd4_total_integrated_manual.rds")
+
+if (!file.exists(int_path)) {
+  stop(
+    "Missing integrated object: ", int_path,
+    "\nRun scRNA-seq/1.1.Integration_annotation.Rmd first."
+  )
+}
+
+int <- readRDS(int_path)
+```
+
+---
+
+# 2 — IFN and MX1 expression
+
+## Pseudobulk approach
+
+```{r ifn-mx1-pseudobulk}
+# Manual pseudobulk per (patient, tissue, annotation)
+cgenes <- c("IFI6", "MX1")
+
+cols <- c(
+  "PBMC" = "#0072B2",
+  "TILN" = "#D55E00"
+)
+
+DefaultAssay(int) <- "RNA"
+
+# Expects these columns to exist:
+# - ident:  annotation
+# - sample: patient_tissue
+if (!all(c("annotation", "patient", "tissue") %in% colnames(int@meta.data))) {
+  stop(
+    "Required metadata columns not found in int@meta.data. Need: annotation, patient, tissue.\n",
+    "Available columns include: ", paste(head(colnames(int@meta.data), 25), collapse = ", ")
+  )
+}
+
+int$patient_tissue <- paste(int$patient, int$tissue, sep = ".")
+
+# Keep only groups with at least 5 cells
+meta <- int@meta.data %>%
+  dplyr::mutate(cell = rownames(int@meta.data))
+
+groups <- meta %>%
+  dplyr::count(patient, tissue, annotation, name = "n_cells") %>%
+  dplyr::filter(n_cells >= 5) %>%
+  dplyr::mutate(sample_id = paste(patient, tissue, annotation, sep = "_"))
+
+meta <- meta %>%
+  dplyr::inner_join(
+    groups %>% dplyr::select(patient, tissue, annotation, n_cells, sample_id),
+    by = c("patient", "tissue", "annotation")
+  )
+
+# Raw counts (all genes) for pseudobulk aggregation
+counts <- Seurat::GetAssayData(int, assay = "RNA", layer = "counts")[, meta$cell, drop = FALSE]
+
+# Pseudobulk sum per group
+sample_index <- factor(meta$sample_id, levels = unique(groups$sample_id))
+design <- Matrix::sparse.model.matrix(~ 0 + sample_index)
+colnames(design) <- levels(sample_index)
+
+mat_counts <- counts %*% design
+
+# Log1p normalization (after pseudobulk aggregation)
+total_counts <- Matrix::colSums(mat_counts)
+mat_log1p <- Log_Normalize(
+  mat = mat_counts,
+  total.counts = total_counts,
+  scale.factor = 1e4,
+  margin = 2L
+)
+
+# Subset genes after log1p normalization
+mat <- mat_log1p[cgenes, , drop = FALSE]
+```
+
+```{r ifn-mx1-tidy}
+df <- mat %>%
+  t() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("id") %>%
+  pivot_longer(
+    -id,
+    names_to = "gene",
+    values_to = "Expression Level"
+  ) %>%
+  separate(id, sep = "_", into = c("patient", "tissue", "annotation"))
+```
+
+```{r ifn-mx1-boxplot, fig.width=7, fig.height=4}
+pos_box <- position_dodge2(width = 0.5, preserve = "single")
+pos_points <- position_jitterdodge(
+  jitter.width = 0.18,
+  jitter.height = 0,
+  dodge.width = 0.7
+)
+
+tissue_levels <- names(cols)
+if (is.null(tissue_levels)) tissue_levels <- unique(df$tissue)
+
+pl <- df %>%
+  mutate(tissue = factor(tissue, levels = tissue_levels)) %>%
+  ggplot(aes(x = annotation, y = `Expression Level`, fill = tissue)) +
+  geom_boxplot(
+    alpha = 0.2,
+    outlier.color = NA,
+    position = pos_box
+  ) +
+  geom_point(
+    color = "black",
+    shape = 21,
+    position = pos_points,
+    size = 2,
+    alpha = 0.7,
+    show.legend = FALSE
+  ) +
+  scale_fill_manual(values = cols, drop = FALSE) +
+  scale_color_manual(values = cols) +
+  facet_wrap(~gene) +
+  labs(x = "Identity") +
+  ggpubr::theme_classic2() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1),
+    axis.title.x = element_blank()
+  )
+
+pl
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
