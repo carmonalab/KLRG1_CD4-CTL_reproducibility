@@ -1,0 +1,179 @@
+---
+title: "GeoMx Spatial — 3. Heatmap markers"
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Overview
+
+Reproduce the **TFH markers heatmap** corresponding to Fig 4F.
+GeoMx cache produced in `GeoMx_spatial/1.Data_processing.Rmd`.
+
+**Input:** `GeoMx_spatial/cache/GeoMx_rawdata_metadata.rds`
+
+---
+
+# 0 — Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Reproducible R environment (recommended)
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+```{r packages}
+library(here)
+library(tidyverse)
+library(DESeq2)
+library(pheatmap)
+library(RColorBrewer)
+```
+
+```{r paths}
+cache_dir <- here::here("GeoMx_spatial", "cache")
+geomx_path <- file.path(cache_dir, "GeoMx_rawdata_metadata.rds")
+```
+
+---
+
+# 1 — Load GeoMx cache
+
+```{r load-geomx}
+if (!file.exists(geomx_path)) {
+  warning(
+    "Missing GeoMx cache: ", geomx_path,
+    "\nRun GeoMx_spatial/1.Data_processing.Rmd first (chunks: `download`, then `save-cache`).",
+    call. = FALSE
+  )
+  stop("Cannot proceed without GeoMx cache.", call. = FALSE)
+}
+geomx <- readRDS(geomx_path)
+
+sample_info <- geomx$metadata %>%
+  filter(Type != "perilipin")
+rawdata <- geomx$rawdata[, rownames(sample_info), drop = FALSE]
+
+stopifnot(!is.null(rawdata), !is.null(sample_info))
+
+cat("Raw matrix:", nrow(rawdata), "genes x", ncol(rawdata), "spots\n")
+cat("Metadata:", nrow(sample_info), "spots x", ncol(sample_info), "columns\n")
+```
+
+---
+
+# 2 — Heatmap TFH markers
+
+## 2A — Normalize data (VST)
+
+Corresponding to **Fig 4F** heatmap panel (TFH markers).
+
+```{r normalize-vst}
+# Filter for CD4 spots with B_dist info
+sample_info_cd4 <- sample_info %>%
+  filter(Type == "CD4", !is.na(B_dist)) %>%
+  arrange(Localisation, B_dist)
+
+countdata <- rawdata[, rownames(sample_info_cd4), drop = FALSE]
+
+dds <- DESeqDataSetFromMatrix(
+  countData = countdata,
+  colData = sample_info_cd4,
+  design = ~ B_dist
+)
+
+# Remove genes with very low counts
+dds <- dds[rowSums(counts(dds)) > 10, ]
+
+# DESeq2 size factor normalization + VST
+DESeq.ds_f <- estimateSizeFactors(dds)
+vsd <- vst(DESeq.ds_f, blind = TRUE)
+
+norm_counts <- assay(vsd)
+```
+
+## 2B — Select TFH genes via DEG filter
+
+```{r tfh-deg-filter}
+# TFH gene set (copied from simple_new_analysis.Rmd)
+tfh.genes <- c(
+  "BCL6", "CXCR5", "PDCD1", "TOX", "TOX2", "IRF4", "MAF",
+  "CBA2T3", "ICOS", "IL6", "IL10", "IL2", "CD28", "TNFRSF4",
+  "IL2RA", "CD69", "FAS", "CD40LG", "B3GAT1", "SH2D1A",
+  "IL21", "STAT4", "CEBPA", "NFIA", "IL4", "CXCR4", "ASCL2", "S1PR2"
+)
+
+dds2 <- DESeq(dds)
+resLFC <- lfcShrink(dds2, coef = resultsNames(dds2)[2], type = "apeglm") %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("gene") %>%
+  mutate(padj = ifelse(is.na(padj), 1, padj))
+
+tfh_deg <- resLFC %>%
+  filter(
+    gene %in% tfh.genes,
+    padj < 0.6,
+    abs(log2FoldChange) > 0.15
+  ) %>%
+  arrange(log2FoldChange) %>%
+  pull(gene)
+
+tfh_deg
+```
+
+## 2C — Heatmap
+
+Corresponding to Figure 4F
+
+```{r heatmap-tfh-markers, fig.height=3}
+
+# Column annotations
+colmeta <- sample_info_cd4[, c("B_dist"), drop = FALSE] %>% 
+  arrange(B_dist)
+
+
+mat <- norm_counts[tfh_deg, rownames(colmeta), drop = FALSE]
+
+# Row-wise z-score and cap values to match a fixed scale
+scale_top <- 1.5
+mat_z <- t(scale(t(mat)))
+mat_z[mat_z > scale_top] <- scale_top
+mat_z[mat_z < -scale_top] <- -scale_top
+
+hm_breaks <- seq(-scale_top, scale_top, length.out = 101)
+hm_cols <- colorRampPalette(
+  rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu"))
+)(length(hm_breaks) - 1)
+
+
+pheatmap::pheatmap(
+  mat = mat_z,
+  scale = "none",
+  cluster_rows = FALSE,
+  cluster_cols = FALSE,
+  annotation_col = colmeta,
+  show_colnames = FALSE,
+  breaks = hm_breaks,
+  color = hm_cols
+)
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
