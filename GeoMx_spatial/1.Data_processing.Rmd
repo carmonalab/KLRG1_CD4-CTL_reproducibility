@@ -1,0 +1,214 @@
+---
+title: "GeoMx Spatial — 1. Data Processing"
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Overview
+
+This notebook imports GeoMx/NanoString spatial expression tables and saves a single cached object as an `.rds`.
+
+The raw input files are hosted on Zenodo (DOI: <https://doi.org/10.5281/zenodo.18761515>) and are downloaded automatically into `GeoMx_spatial/cache/`.
+For the CD4/CD20 segments used here, the relevant archive in the record is `data_CD4CD20_segments.zip`.
+
+**Output:** `GeoMx_spatial/cache/GeoMx_rawdata_metadata.rds` — a list with:
+
+- `$raw.data`: raw expression matrix (genes × spots)
+- `$meta.data`: spot metadata (one row per spot)
+
+---
+
+# 0 — Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE,
+                      fig.width = 12, fig.height = 8)
+```
+
+## Reproducible R environment (recommended)
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+```{r packages}
+library(tidyverse)
+library(openxlsx)
+library(here)
+library(Matrix)
+```
+
+```{r paths}
+cache_dir <- here::here("GeoMx_spatial", "cache")
+dir.create(cache_dir, recursive = TRUE, showWarnings = FALSE)
+
+# GeoMx input files are downloaded from Zenodo into `cache_dir`.
+zenodo_record <- "18761515"  # DOI: 10.5281/zenodo.18761515
+```
+
+---
+
+# 1 — Download data from Zenodo
+
+```{r download}
+base_url <- paste0("https://zenodo.org/records/", zenodo_record, "/files")
+
+# Zenodo archive containing the CD4/CD20 segments tables.
+zip_name <- "data_CD4CD20_segments.zip"
+zip_path <- file.path(cache_dir, zip_name)
+
+if (!file.exists(zip_path)) {
+  url <- paste0(base_url, "/", zip_name, "?download=1")
+  cat("Downloading ", zip_name, " ...\n", sep = "")
+  utils::download.file(url = url, destfile = zip_path, mode = "wb", quiet = FALSE)
+} else {
+  cat(zip_name, " already present — skipping download.\n", sep = "")
+}
+
+# Unzip (idempotent-ish): only unzip if the expected folder isn't present.
+unzipped_dir <- file.path(cache_dir, "data_CD4CD20 segments")
+if (!dir.exists(unzipped_dir)) {
+  cat("Unzipping ", zip_name, " ...\n", sep = "")
+  utils::unzip(zipfile = zip_path, exdir = cache_dir)
+} else {
+  cat("Zip already extracted — skipping unzip.\n")
+}
+
+# Input files inside the extracted folder
+annotation_file <- file.path(unzipped_dir, "Annotation.xlsx")
+raw_file <- file.path(unzipped_dir, "Raw data.xlsx")
+probe_file <- file.path(unzipped_dir, "Annotation_Probe.xlsx")
+
+missing <- c(annotation_file, raw_file, probe_file)[!file.exists(c(annotation_file, raw_file, probe_file))]
+if (length(missing) > 0) {
+  stop("Missing expected file(s) after unzip:\n", paste("- ", missing, collapse = "\n"))
+}
+```
+
+---
+
+# 2 — Import GeoMx tables
+
+This workflow imports the **CD4/CD20 segments** (lymphoid) and builds a single raw counts matrix plus metadata.
+
+## CD4/CD20 segments
+
+```{r import-lymphoid}
+annot_lym <- openxlsx::read.xlsx(annotation_file)
+
+annot_lym <- annot_lym %>%
+  mutate(
+    Patient_letter = Patient,
+    Patient = factor(
+      Patient,
+      levels = c("A", "B", "C", "D", "E"),
+      labels = c("LAU706", "LAU380", "LAU1417", "LAU372", "LAU1397")
+    )
+  )
+
+raw_lym <- openxlsx::read.xlsx(raw_file)
+```
+
+## Probe → gene mapping (if needed)
+
+In the original dataset, some raw tables use probe-coded gene identifiers. If your raw tables already use gene symbols as rownames/first column, you can skip this.
+
+```{r import-probes}
+probe_lym <- openxlsx::read.xlsx(probe_file) %>%
+  filter(CodeClass == "Endogenous")
+
+probe_map <- probe_lym %>%
+  select(TargetName, DisplayName)
+```
+
+---
+
+# 2 — Build `$raw.data` and `$meta.data`
+
+This block standardizes the raw tables into a genes × spots numeric matrix and concatenates spot metadata.
+
+```{r build-geomx-object}
+# Helper: convert a GeoMx raw table to a numeric matrix.
+# Assumption: first column contains gene/probe IDs; remaining columns are spots.
+raw_to_matrix <- function(raw_df) {
+  raw_df <- as.data.frame(raw_df)
+  gene_col <- raw_df[[1]]
+  mat <- raw_df[, -1, drop = FALSE]
+  mat <- as.matrix(suppressWarnings(apply(mat, 2, as.numeric)))
+  rownames(mat) <- make.unique(as.character(gene_col))
+  mat
+}
+
+mat_lym <- raw_to_matrix(raw_lym)
+
+# Optional: map probe IDs to gene symbols when they match TargetName
+map_rows_to_gene <- function(mat, probe_map) {
+  if (!all(c("TargetName", "DisplayName") %in% colnames(probe_map))) return(mat)
+  idx <- match(rownames(mat), probe_map$TargetName)
+  new_names <- rownames(mat)
+  new_names[!is.na(idx)] <- probe_map$DisplayName[idx[!is.na(idx)]]
+  rownames(mat) <- make.unique(new_names)
+  mat
+}
+
+mat_lym <- map_rows_to_gene(mat_lym, probe_map)
+
+raw_mat <- mat_lym
+
+# Build metadata. Ensure rownames correspond to spot IDs == colnames(raw_mat)
+meta_lym <- annot_lym
+
+# Try to detect spot ID column
+spot_col <- function(df) {
+  candidates <- c("SegmentDisplayName", "Segment", "SegmentID", "ROI", "Spot", "Sample_ID")
+  hit <- candidates[candidates %in% colnames(df)][1]
+  if (!is.na(hit)) return(hit)
+  # fallback: first column
+  colnames(df)[1]
+}
+
+spot_lym <- spot_col(meta_lym)
+
+meta <- meta_lym %>%
+  mutate(Spot = as.character(.data[[spot_lym]])) %>%
+  distinct(Spot, .keep_all = TRUE)
+
+# Align metadata row order to matrix columns
+common_spots <- intersect(colnames(raw_mat), meta$Spot)
+raw_mat <- raw_mat[, common_spots, drop = FALSE]
+meta <- meta %>% filter(Spot %in% common_spots) %>% arrange(match(Spot, common_spots))
+rownames(meta) <- meta$Spot
+
+geomx <- list(
+  raw.data = raw_mat,
+  meta.data = meta
+)
+
+str(geomx, max.level = 1)
+```
+
+---
+
+# 3 — Save cache object
+
+```{r save-cache}
+out_path <- file.path(cache_dir, "GeoMx_rawdata_metadata.rds")
+saveRDS(geomx, out_path)
+cat("Saved:", out_path, "\n")
+```
+
+---
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+```
