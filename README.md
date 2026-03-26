@@ -123,11 +123,9 @@ All raw and processed data used in this study are publicly available:
 
 * **scRNA-seq datasets**
   Zenodo: `10.5281/zenodo.18683366`
-  (Downloaded within relevant notebooks)
 
 * **GeoMx spatial transcriptomics data**
   Zenodo: `10.5281/zenodo.18761515`
-  (Automatically retrieved in GeoMx workflows)
 
 ---
 
