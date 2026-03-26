@@ -106,7 +106,7 @@ if (!"Sample" %in% colnames(zheng@meta.data)) {
   }
 }
 
-# Retain onlyh CD4+ T cells
+# Retain only CD4+ T cells
 cd4 <- subset(zheng, subset = authors_Tcell == "CD4T")
 cat("CD4 cells retained: ", ncol(cd4), "\n", sep = "")
 print(table(cd4$Sample))

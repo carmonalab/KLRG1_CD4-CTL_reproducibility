@@ -18,6 +18,14 @@ This script loads the integrated/annotated Seurat object generated in
 `1.2.Integration_annotation.Rmd` and measures the **IFN and MX1 expression**
 using a pseudobulk per patient and tissue approach.
 
+## Input
+
+- `scRNA-seq/cache/cd4_total_integrated_manual.rds`
+
+## Output
+
+- Figures/tables are produced in the rendered report (no additional cache file is required).
+
 ---
 
 # 0 — Setup

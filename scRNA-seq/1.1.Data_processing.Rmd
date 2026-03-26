@@ -55,6 +55,7 @@ library(openxlsx) # read/write metadata spreadsheet (.xlsx)
 library(ggplot2)
 library(patchwork)
 library(tidyverse)
+library(here)     # project-relative paths
 ```
 
 ```{r paths}

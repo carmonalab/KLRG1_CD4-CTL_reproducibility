@@ -15,7 +15,9 @@ output:
 Differential expression analysis on GeoMx spatial spots (CD4 spots) using DESeq2 normalization/variance stabilization.
 
 
-**Input:** `GeoMx_spatial/cache/GeoMx_raw.data_metadata.rds`
+**Input:** `GeoMx_spatial/cache/GeoMx_rawdata_metadata.rds`
+
+**Outputs:** Volcano plots shown inline in the corresponding figure chunks. (Optional) DEG result tables can be saved from `res_*` objects if needed.
 
 This notebook generates DEG results and then produces volcano plots directly from those results.
 
@@ -43,7 +45,6 @@ library(DESeq2)
 library(ggrepel)
 library(ggpubr)
 library(scales)
-library(patchwork)
 ```
 
 ```{r parameters}
@@ -75,13 +76,25 @@ if (!file.exists(geomx_path)) {
 }
 geomx <- readRDS(geomx_path)
 
-sample_info <- geomx$metadata %>% 
-  filter(Type != "perilipin")
-raw.data <- geomx$rawdata[,rownames(sample_info)]
+# Script 1 saves the cache as a list with $raw.data and $meta.data
+rawdata <- geomx$raw.data %||% geomx$rawdata
+sample_info <- geomx$meta.data %||% geomx$metadata
 
-stopifnot(!is.null(raw.data), !is.null(sample_info))
+stopifnot(!is.null(rawdata), !is.null(sample_info))
 
-cat("Raw matrix:", nrow(raw.data), "genes x", ncol(sample_info), "spots\n")
+# Keep only CD4/CD20 segments (no perilipin in this reproducibility pipeline)
+if ("Type" %in% colnames(sample_info)) {
+  sample_info <- sample_info %>% filter(Type != "perilipin")
+}
+
+# Ensure matrix columns match metadata rows
+if (!is.null(colnames(rawdata)) && !is.null(rownames(sample_info))) {
+  common <- intersect(colnames(rawdata), rownames(sample_info))
+  rawdata <- rawdata[, common, drop = FALSE]
+  sample_info <- sample_info[common, , drop = FALSE]
+}
+
+cat("Raw matrix:", nrow(rawdata), "genes x", ncol(rawdata), "spots\n")
 cat("Metadata:", nrow(sample_info), "spots x", ncol(sample_info), "columns\n")
 
 if (!file.exists(volcano_util_path)) {
@@ -158,7 +171,7 @@ imm_cd20 <- sample_info %>%
   filter(Localisation %in% c("inside", "outside")) %>%
   drop_na(Localisation)
 
-count_cd20 <- raw.data[, rownames(imm_cd20), drop = FALSE]
+count_cd20 <- rawdata[, rownames(imm_cd20), drop = FALSE]
 col_cd20 <- imm_cd20 %>%
   select(Localisation, Patient, Type)
 
@@ -176,7 +189,7 @@ imm_cd4 <- sample_info %>%
   filter(Localisation %in% c("inside", "outside")) %>%
   drop_na(Localisation)
 
-count_cd4 <- raw.data[, rownames(imm_cd4), drop = FALSE]
+count_cd4 <- rawdata[, rownames(imm_cd4), drop = FALSE]
 col_cd4 <- imm_cd4 %>%
   select(Localisation, Patient, Type, B_dist)
 
@@ -200,7 +213,7 @@ if (!"B_dist" %in% colnames(sample_info)) {
     filter(B_dist %in% c("close", "far")) %>%
     drop_na(B_dist)
 
-  count_cd4_inside <- raw.data[, rownames(imm_cd4_inside), drop = FALSE]
+  count_cd4_inside <- rawdata[, rownames(imm_cd4_inside), drop = FALSE]
   col_cd4_inside <- imm_cd4_inside %>%
     select(B_dist, Patient, Type, Localisation)
 
@@ -221,7 +234,7 @@ if (!"B_dist" %in% colnames(sample_info)) {
     filter(B_dist %in% c("close", "far")) %>%
     drop_na(B_dist)
 
-  count_cd4_outside <- raw.data[, rownames(imm_cd4_outside), drop = FALSE]
+  count_cd4_outside <- rawdata[, rownames(imm_cd4_outside), drop = FALSE]
   col_cd4_outside <- imm_cd4_outside %>%
     select(B_dist, Patient, Type, Localisation)
 

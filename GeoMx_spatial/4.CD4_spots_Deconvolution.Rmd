@@ -156,6 +156,8 @@ u_scores <- u_scores %>%
 
 # 4 — Plot signature scores by GeoMx metadata
 
+Corresponding to Figure 4G
+
 ```{r deconvolution-boxplot}
 if (!all(c("Type", "B_dist") %in% colnames(metadata))) {
   stop("Expected metadata columns missing: need at least Type and B_dist")

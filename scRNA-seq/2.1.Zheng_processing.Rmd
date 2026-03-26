@@ -63,6 +63,7 @@ library(Seurat)
 library(SingleCellExperiment)
 library(STACAS)
 library(SignatuR)
+library(openxlsx)
 
 
 read_excel_allsheets <- function(filename) {
