@@ -13,7 +13,7 @@ output:
 ## Input
 
 - `scRNA-seq/cache/cd4_total_integrated_manual.rds` — Seurat object produced by
-  `scRNA-seq/1.1.Integration_annotation.Rmd`. Contains all integrated CD4 T cells
+  `scRNA-seq/1.2.Integration_annotation.Rmd`. Contains all integrated CD4 T cells
   with columns `patient`, `tissue`, `annotation`, and `KLRG1_expression`
   (KLRG1+/KLRG1−) added in section 9.3 of that script.
 
@@ -68,7 +68,7 @@ in_rds    <- file.path(cache_dir, "cd4_total_integrated_manual.rds")
 
 if (!file.exists(in_rds)) {
   stop("Input not found: ", in_rds,
-       "\nRun scRNA-seq/1.1.Integration_annotation.Rmd first.")
+      "\nRun scRNA-seq/1.2.Integration_annotation.Rmd first.")
 }
 ```
 
@@ -84,11 +84,11 @@ cat("Cells loaded:", ncol(int), "\n")
 cat("Patients:    ", n_distinct(int$patient), "\n")
 print(table(int$tissue, useNA = "ifany"))
 
-# Ensure KLRG1_expression is present (added in 1.1 section 9.3)
+# Ensure KLRG1_expression is present (added in 1.2 script, section 9.3)
 if (!"KLRG1_expression" %in% colnames(int@meta.data)) {
   stop(
     "Column 'KLRG1_expression' not found in the loaded object.\n",
-    "Re-run 1.1.Integration_annotation.Rmd (section 9.3) to add it."
+    "Re-run 1.2.Integration_annotation.Rmd (section 9.3) to add it."
   )
 }
 ```

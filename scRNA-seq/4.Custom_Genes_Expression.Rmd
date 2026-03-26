@@ -15,7 +15,7 @@ output:
 # Overview
 
 This script loads the integrated/annotated Seurat object generated in
-`1.1.Integration_annotation.Rmd` and measures the **IFN and MX1 expression**
+`1.2.Integration_annotation.Rmd` and measures the **IFN and MX1 expression**
 using a pseudobulk per patient and tissue approach.
 
 ---
@@ -83,7 +83,7 @@ Log_Normalize <- function(mat,
 }
 ```
 
-# 1 — Load integrated object (from 1.1)
+# 1 — Load integrated object (from 1.2 script)
 
 ```{r load-integrated}
 library(here)
@@ -92,7 +92,7 @@ int_path <- file.path(cache_dir, "cd4_total_integrated_manual.rds")
 if (!file.exists(int_path)) {
   stop(
     "Missing integrated object: ", int_path,
-    "\nRun scRNA-seq/1.1.Integration_annotation.Rmd first."
+    "\nRun scRNA-seq/1.2.Integration_annotation.Rmd first."
   )
 }
 
