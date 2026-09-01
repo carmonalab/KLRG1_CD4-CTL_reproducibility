@@ -163,7 +163,7 @@ int <- FindClusters(int, resolution = 0.4, algorithm = 1)
 
 Corresponding to Supp Fig 1B
 ```{r umap-clustering}
-UMAPPlot(int, group.by = "integrated_snn_res.0.4", label = TRUE, repel = TRUE) +
+up <- UMAPPlot(int, group.by = "integrated_snn_res.0.4", label = TRUE, repel = TRUE) +
   ggtitle("Unsupervised clusters (res=0.4)")
 ```
 
@@ -227,15 +227,62 @@ print(table(int$annotation, useNA = "ifany"))
 Corresponding to Figure 1D
 
 ```{r umap-annotation}
-UMAPPlot(int, group.by = "annotation",
-         label = TRUE,
-         repel = TRUE,
-         cols = cd4_annotation_palette) +
+up_annot <- UMAPPlot(int, group.by = "annotation",
+                     label = F,
+                     repel = F,
+                     cols = cd4_annotation_palette) +
   ggtitle("Manual annotation")
 ```
 
+```{r}
+new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
 
-## 5.3 Custom annotation dotplots
+fig_path <- file.path(new_fig, "Supp1B_umap_waxes.pdf")
+
+pdf(fig_path, width = 5.3, height = 5)
+up
+dev.off()
+
+
+fig_path <- file.path(new_fig, "1D_umap_waxes.pdf")
+
+pdf(fig_path, width = 6, height = 5)
+up_annot
+dev.off()
+```
+
+### 5.3 Feature plots
+
+```{r}
+int <- readRDS("cache/cd4_total_integrated_manual.rds")
+
+gene_list <- c("GZMB", "GNLY", "NKG7", "GZMA", "PRF1")
+```
+
+```{r}
+Idents(int) <- "annotation"
+ft <- FeaturePlot(int,
+                  features = gene_list,
+                  cols = c("grey", "red"),
+                  min.cutoff = 0,
+                  label = T,
+                  order = T)
+```
+
+```{r}
+new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
+
+fig_path <- file.path(new_fig, "umap_featureplot_CTL_markers.pdf")
+
+pdf(fig_path, width = 7, height = 9)
+ft
+dev.off()
+```
+
+
+
+
+## 5.4 Custom annotation dotplots
 
 Corresponding to Figure 1E (left)
 
@@ -267,6 +314,59 @@ dotplot_seurat_style(
                         mid = "gray80",
                         midpoint = 0.7) +
   labs(color = "Average\nExpression")
+```
+### Cytotoxic gene scoring
+
+```{r}
+library(UCell)
+
+sig <- list(cytotoxic_score = cd4_cytotoxic_markers)
+
+int <- AddModuleScore_UCell(int,
+                            features = sig,
+                            ncores = 6,
+                            name = "")
+```
+
+```{r}
+df_ctl <- int@meta.data %>% 
+  filter(annotation == "Cytotoxic") %>% 
+  dplyr::select(tissue, cytotoxic_score)
+
+ctl_score_pl <- df_ctl %>% 
+  ggplot(aes(x = tissue, y = cytotoxic_score, fill = tissue)) +
+  geom_violin(
+    trim = FALSE,
+    alpha = 0.5,
+    color = "grey25",
+    linewidth = 0.4
+  ) +
+  # Mean
+  stat_summary(
+    fun = mean,
+    geom = "crossbar",
+    width = 0.5,
+    color = "black",
+    linewidth = 0.5,
+    alpha = 0.5
+  ) +
+  scale_fill_manual(values = c("PBMC" = "#0072B2", "TILN" = "#D55E00")) +
+  labs(
+    x = NULL,
+    y = "Cytotoxicity score"
+  ) +
+  ggpubr::theme_classic2() +
+  NoLegend()
+```
+
+```{r}
+new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
+
+fig_path <- file.path(new_fig, "violin_cytotoxic_score_annotation.pdf")
+
+pdf(fig_path, width = 3, height = 4)
+ctl_score_pl
+dev.off()
 ```
 
 ---

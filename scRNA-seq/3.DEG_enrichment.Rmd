@@ -230,10 +230,17 @@ head(res_df, 20)
 # 5 — Volcano plot: PBMC KLRG1+ vs KLRG1−
 
 Corresponding to Figure 2B
+```{r}
+dir <- "~/Documents/Projects/Collab_Jandus/20260206_Paper_MC/tables"
+fpath <- file.path(dir, "DEG_Pseudobulk_PBMC_KLRG1_POS_vs_KLRG1_NEG.xlsx")
+res_df <- readxl::read_xlsx(fpath)
+```
+
 
 ```{r volcano, fig.width=13, fig.height=10}
 fc  <- 1.5
 fdr <- 0.05
+label_size <- 7
 
 pseudolog10 <- function(x) {
   sign(x) * log10(abs(x) + 1)
@@ -270,12 +277,13 @@ vol_plot <- vol_data %>%
     data = subset(vol_data,
                   sig >= -log10(fdr) & abs(log2FC) >= log2(fc) &
                     Spec != "Relevant cytotoxic gene"),
-    size = 4, fontface = "italic", max.overlaps = 5
+    size = label_size, fontface = "italic", max.overlaps = 5
   ) +
   ggrepel::geom_label_repel(
     aes(label = ifelse(Spec == "Relevant cytotoxic gene", gene, NA)),
     color = "white", fill = "#3B75AF", fontface = "italic",
-    na.rm = TRUE
+    na.rm = TRUE,
+    size = label_size
   ) +
   scale_color_manual(values = c("Other" = "grey30",
                                 "Relevant cytotoxic gene" = "#3B75AF")) +
@@ -304,6 +312,16 @@ vol_plot <- vol_data %>%
 
 vol_plot
 ```
+```{r}
+new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
+dir.create(new_fig)
+fig_path <- file.path(new_fig, "Volcano_2B.pdf")
+
+pdf(fig_path, width = 13*0.9, height = 10*0.9)
+vol_plot
+dev.off()
+```
+
 
 ---
 
