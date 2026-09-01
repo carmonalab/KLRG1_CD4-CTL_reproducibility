@@ -1,0 +1,281 @@
+---
+title: "Oh et al. human bladder cancer - CD4 Data Processing"
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Overview
+
+This script downloads, loads, and processes the Oh et al. 2020 bladder cancer CD4+ T cell dataset
+for integration with the KLRG1 CD4-CTL reproducibility project. The script:
+
+## Dataset Information
+- **title**: Intratumoral CD4+ T Cells Mediate Anti-tumor Cytotoxicity in Human Bladder Cancer
+- **doi**: https://doi.org/10.1016/j.cell.2020.05.017
+- **Data source**: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149652
+- **Output**: `scRNA-seq/cache/Oh_2020_32497499_whole.rds` (CD4+, high-quality cells)
+
+---
+
+# 0 - Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  echo = TRUE
+)
+```
+
+
+## Reproducible R environment (recommended)
+
+To reproduce the exact software environment used for this analysis,
+restore packages from the repository `renv.lock` file before running
+the pipeline.
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+## Load and attach packages
+
+```{r load_packages, message=FALSE}
+library(here)
+library(tidyverse)
+library(Seurat)
+library(SingleCellExperiment)
+library(STACAS)
+library(SignatuR)
+library(openxlsx)
+
+
+read_excel_allsheets <- function(filename) {
+  sheets <- openxlsx::getSheetNames(filename)
+  x <- lapply(sheets, function(sheet_name) {
+    openxlsx::read.xlsx(filename, sheet = sheet_name)
+  })
+  names(x) <- sheets
+  x
+}
+
+
+options(timeout = 4000) # increase timeout for downloading
+set.seed(321)
+```
+
+## Define parameters
+
+```{r define_parameters}
+# Dataset identifiers
+ds_name <- "Oh_2020_32497499"
+dataset_id <- "OhD"
+species <- "human"
+
+# QC filtering parameters
+min_cells_per_sample <- 100
+```
+
+## Set up data paths
+
+```{r setup_paths}
+# Reference gene annotations (for gene symbol standardization) from STACAS
+data("EnsemblGeneTable.Hs")
+
+# Data paths
+data_dir <- here("data")
+input_data_path <- file.path(data_dir, "GSE149652")
+list.files(input_data_path)
+```
+
+# 1 - Download data
+
+Data downloaded from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149652
+
+
+# 2 - Load data
+
+## Load data
+
+```{r load_raw_data}
+# annotation column
+annotation <- "cell_types"
+
+cellinfo <- read.csv(file.path(input_data_path,
+                               "GSE149652_CD4_TIL_droplet_cellinfo_matrice.csv.gz")) %>% 
+  tibble::column_to_rownames("index")
+# only for CD4 T cells
+raw_counts <- data.table::fread(
+  file.path(input_data_path, "GSE149652_CD4_TIL_droplet_count_matrice.csv.gz"),
+  data.table = FALSE
+)
+rownames(raw_counts) <- raw_counts[[1]]
+raw_counts <- raw_counts[, -1, drop = FALSE]
+
+head(rownames(cellinfo))
+head(colnames(raw_counts))
+
+identical(rownames(cellinfo), colnames(raw_counts))
+```
+
+
+```{r create_Seurat}
+seu <- CreateSeuratObject(counts = raw_counts,
+                          meta.data = cellinfo)
+# Standardize gene symbols
+seu <- STACAS::StandardizeGeneSymbols(seu,
+                                      slot = "counts",
+                                      EnsemblGeneTable = EnsemblGeneTable.Hs)
+```
+
+# 3 - Quality Control and Filtering
+
+## Calculate QC metrics
+
+```{r calculate_qc_metrics}
+library(SignatuR)
+data("SignatuR")
+
+# Get mitochondrial and ribosomal gene signatures
+mito_genes <- GetSignature(SignatuR$Hs$Compartments$Mito) %>% 
+  unlist()
+ribo_genes <- GetSignature(SignatuR$Hs$Compartments$Ribo) %>%
+  unlist()
+
+# Add QC metrics to metadata
+seu <- AddMetaData(
+  seu,
+  metadata = PercentageFeatureSet(
+    seu,
+    features = mito_genes[mito_genes %in% rownames(seu)]
+  ),
+  col.name = "percent_mito"
+)
+
+seu <- AddMetaData(
+  seu,
+  metadata = PercentageFeatureSet(
+    seu,
+    features = ribo_genes[ribo_genes %in% rownames(seu)]
+  ),
+  col.name = "percent_ribo"
+)
+
+# Add sequencing complexity metric
+seu$log10_genes_per_umi <- log10(seu$nFeature_RNA) / log10(seu$nCount_RNA)
+
+cat("QC metrics calculated\n")
+```
+
+## Visualize QC metrics before filtering
+
+```{r qc_violin, fig.height=12, fig.width=7}
+# Set sample identity for visualization
+Idents(seu) <- "orig.ident"
+
+# Violin plot of QC metrics
+VlnPlot(
+  seu,
+  features = c("nFeature_RNA", "nCount_RNA",
+               "percent_mito", "percent_ribo",
+               "log10_genes_per_umi"),
+  ncol = 2,
+  pt.size = 0
+)
+```
+
+## QC filtering
+
+Apply standard QC thresholds:
+
+```{r qc_filter}
+# Store initial cell count
+n_cells_initial <- ncol(seu)
+
+# Define QC thresholds
+qc_thresholds <- list(
+  nFeature_RNA = c(min = 200, max = 6000),
+  nCount_RNA = c(min = 600, max = 10000),
+  percent_mito = c(min = 0, max = 5),
+  percent_ribo = c(min = 0, max = 60),
+  log10_genes_per_umi = 0.7
+)
+
+# Apply filtering
+seu <- subset(
+  seu,
+  subset = 
+    nFeature_RNA >= qc_thresholds$nFeature_RNA["min"] &
+    nFeature_RNA < qc_thresholds$nFeature_RNA["max"] &
+    nCount_RNA >= qc_thresholds$nCount_RNA["min"] &
+    nCount_RNA < qc_thresholds$nCount_RNA["max"] &
+    percent_mito >= qc_thresholds$percent_mito["min"] &
+    percent_mito < qc_thresholds$percent_mito["max"] &
+    percent_ribo >= qc_thresholds$percent_ribo["min"] &
+    percent_ribo < qc_thresholds$percent_ribo["max"] &
+    log10_genes_per_umi > qc_thresholds$log10_genes_per_umi
+)
+
+n_cells_filtered <- ncol(seu)
+pct_retained <- 100 * n_cells_filtered / n_cells_initial
+
+cat("QC filtering complete\n")
+cat("Initial cells:", n_cells_initial, "\n")
+cat("Filtered cells:", n_cells_filtered, "\n")
+cat("Retained:", sprintf("%.1f%%", pct_retained), "\n")
+```
+
+## Remove small samples
+
+```{r remove_small_samples}
+# Remove samples with fewer than minimum cells
+sample_id <- "Sample_ID"
+tab <- table(seu@meta.data[[sample_id]])
+keep_samples <- names(tab)[tab > min_cells_per_sample]
+
+n_samples_before <- length(unique(seu@meta.data[[sample_id]]))
+seu <- subset(seu, Sample_ID %in% keep_samples)
+n_samples_after <- length(unique(seu@meta.data[[sample_id]]))
+
+cat("Samples before:", n_samples_before, "\n")
+cat("Samples after (removed small samples):", n_samples_after, "\n")
+cat("Total cells:", ncol(seu), "\n")
+```
+
+## Normalize data
+
+```{r normalize_data}
+seu <- NormalizeData(seu)
+cat("Data normalized\n")
+```
+
+---
+
+# Save processed object
+
+```{r save_object}
+# Save the merged, filtered, standardized object
+output_file <- file.path(data_dir, paste0(ds_name, "_whole.rds"))
+saveRDS(seu, output_file)
+cat("Processed Oh object saved to:", output_file, "\n")
+cat("Final object dimensions:", nrow(seu), "genes x", ncol(seu), "cells\n")
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```
+
