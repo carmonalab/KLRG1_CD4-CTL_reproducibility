@@ -1,0 +1,384 @@
+---
+title: "Kwek et al. human bladder cancer - Data Processing"
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Overview
+
+This script downloads, loads, and processes the Kwek et al. 2025 bladder cancer CD4+ T cell dataset
+for integration with the KLRG1 CD4-CTL reproducibility project. The script:
+
+## Dataset Information
+- **title**: Identification and regulation of circulating tumor-TCR-matched cytotoxic CD4+ lymphocytes by KLRG1 in bladder cancer
+- **doi**: https://insight.jci.org/articles/view/177373
+- **Data source**: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE293860
+  Additionally, cell-level information was provided by David Oh (Corresponding) via email in file `cell_calls_annotations_josep_sept2026.csv`:
+  
+  ```text 
+  please find attached a csv with the following:
+  10X barcode ("cell_id")
+  final cell annotation in object from JCI insight paper ("cell_calls")
+  sample name ("title")
+  the specific GEO accession that the 10X barcode refers to ("GEO")
+  
+  total 157,054 filtered single cells
+  
+  note that because individual samples were run as individual 10X reactions, there are overlapping 10X barcodes between samples. hence the GEO reference is necessary for you to know, which 10X barcode unambiguously belongs to which named GEO accession (and the cellranger outputs for that sample)
+  
+  good luck!
+  
+  dave
+  ```
+- **Output**: `scRNA-seq/cache/Kwek_2025_39655805.rds` (CD4+, high-quality cells)
+
+---
+
+# 0 - Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  echo = TRUE
+)
+```
+
+
+## Reproducible R environment (recommended)
+
+To reproduce the exact software environment used for this analysis,
+restore packages from the repository `renv.lock` file before running
+the pipeline.
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+## Load and attach packages
+
+```{r load_packages, message=FALSE}
+library(here)
+library(tidyverse)
+library(Seurat)
+library(SingleCellExperiment)
+library(STACAS)
+library(SignatuR)
+library(openxlsx)
+library(BiocParallel)
+
+
+read_excel_allsheets <- function(filename) {
+  sheets <- openxlsx::getSheetNames(filename)
+  x <- lapply(sheets, function(sheet_name) {
+    openxlsx::read.xlsx(filename, sheet = sheet_name)
+  })
+  names(x) <- sheets
+  x
+}
+
+
+options(timeout = 4000) # increase timeout for downloading
+set.seed(321)
+```
+
+## Define parameters
+
+```{r define_parameters}
+# Dataset identifiers
+ds_name <- "Kwek_2025_39655805"
+dataset_id <- "KwekS"
+species <- "human"
+
+# QC filtering parameters
+min_cells_per_sample <- 100
+```
+
+## Set up data paths
+
+```{r setup_paths}
+# Reference gene annotations (for gene symbol standardization) from STACAS
+data("EnsemblGeneTable.Hs")
+
+# Data paths
+data_dir <- here("data")
+input_data_path <- file.path(data_dir, "40299576")
+list.files(input_data_path)
+```
+
+# 1 - Download data
+
+Data downloaded from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE293860 and cell-level metadata (including cell type annotation) provided by corresponding author (see Dataset Information above)
+
+
+# 2 - Load data
+
+## Load data
+
+```{r load_raw_data}
+# annotation column
+annotation <- "cell_types"
+
+cellinfo <- read.csv(file.path(input_data_path,
+                               "cell_calls_annotations_josep_sept2026.csv")) %>% 
+  # rename annotation col for consistency with other datasets
+  dplyr::rename("cell_types" = "cell_calls",
+                "original_cell_id" = "cell_id") %>% 
+  # custom cell id and sample id
+  mutate(title = gsub("antipdl1", "anti_pdl1", title),
+        sample_id = paste(GEO, title,sep = "_"),
+        cell_id = paste(sample_id, original_cell_id, sep = "_")) %>% 
+  # filter only cd4 samples
+  filter(grepl("cd4", title))
+
+sample_md <- cellinfo %>% distinct(title, GEO, sample_id)
+
+# only for CD4 T cells
+cd4_files <- list.files(file.path(input_data_path, "GSE293860_RAW"),
+                        pattern = "cd4",
+                        full.names = T) %>% 
+            # remove tcr sequencing files
+            grep("tcr", ., invert = T, value = T)
+
+
+```
+
+## Run a loop to load all matrices for cd4
+
+```{r}
+library(Matrix)
+samples <- sample_md$sample_id
+
+seu_list <- bplapply(samples, 
+                     BPPARAM = MulticoreParam(workers = 6, progressbar = T),
+                     function(s){
+                       files <- grep(s, cd4_files, value = T)
+                       # load matrix
+                       barcode_file <- files[grepl("barcodes.tsv.gz$", files)]
+                       gene_file    <- files[grepl("genes.tsv.gz$", files)]
+                       matrix_file  <- files[grepl("matrix.mtx.gz$", files)]
+                       # Load sparse matrix
+                       mat <- readMM(gzfile(matrix_file))
+                       # Load genes and barcodes
+                       genes <- read.delim(
+                         gzfile(gene_file),
+                         header = FALSE,
+                         stringsAsFactors = FALSE
+                       )
+                       barcodes <- readLines(gzfile(barcode_file))
+                       # Use gene symbols (column 2) or gene IDs (column 1)
+                       gene_names <- genes[[1]]
+                       # Assign cell and gene names
+                       colnames(mat) <- paste(s, barcodes, sep = "_")
+                       rownames(mat) <- gene_names
+                       
+                       # Create Seurat object
+                       subset_md <- cellinfo %>% 
+                         filter(sample_id == s) %>% 
+                         tibble::column_to_rownames("cell_id")
+                       mat <- mat[,rownames(subset_md)]
+                       
+                       seu <- CreateSeuratObject(counts = mat,
+                                                 meta.data = subset_md)
+                       return(seu)
+                     }) 
+
+```
+
+## Create Seurat object
+
+```{r merge_seurats}
+seu <- merge(seu_list[[1]], seu_list[-1])
+rm(seu_list); gc()
+seu <- JoinLayers(seu)
+```
+
+
+## Standardize genes
+
+```{r gene_Standard}
+# Standardize gene symbols
+seu <- STACAS::StandardizeGeneSymbols(seu,
+                                      slot = "counts",
+                                      EnsemblGeneTable = EnsemblGeneTable.Hs)
+```
+
+# 3 - Quality Control and Filtering
+
+## Calculate QC metrics
+
+```{r calculate_qc_metrics}
+library(SignatuR)
+data("SignatuR")
+
+# Get mitochondrial and ribosomal gene signatures
+mito_genes <- GetSignature(SignatuR$Hs$Compartments$Mito) %>% 
+  unlist()
+ribo_genes <- GetSignature(SignatuR$Hs$Compartments$Ribo) %>%
+  unlist()
+
+# Add QC metrics to metadata
+seu <- AddMetaData(
+  seu,
+  metadata = PercentageFeatureSet(
+    seu,
+    features = mito_genes[mito_genes %in% rownames(seu)]
+  ),
+  col.name = "percent_mito"
+)
+
+seu <- AddMetaData(
+  seu,
+  metadata = PercentageFeatureSet(
+    seu,
+    features = ribo_genes[ribo_genes %in% rownames(seu)]
+  ),
+  col.name = "percent_ribo"
+)
+
+# Add sequencing complexity metric
+seu$log10_genes_per_umi <- log10(seu$nFeature_RNA) / log10(seu$nCount_RNA)
+
+cat("QC metrics calculated\n")
+```
+
+## Visualize QC metrics before filtering
+```{r qc_thresholds}
+qc_thresholds <- list(
+  nFeature_RNA = c(min = 200, max = 2500),
+  nCount_RNA = c(min = 300, max = 9000),
+  percent_mito = c(min = 0, max = 7),
+  percent_ribo = c(min = 5, max = 65),
+  log10_genes_per_umi = 0.7
+)
+
+## QC metrics distribution
+qc_plot <- function(metadata, #seurat object metadata
+                    var, # QC variables to plot
+                    cutoffs,  # list of cutoffs with same names as QC vars
+                    fill = NULL, # groupin variable for density plots
+                    show.legend = T,
+                    split = F
+                    ) {
+  
+
+  metadata %>%
+    ggplot(aes(.data[[var]])) +
+    {if(is.null(fill)){
+      geom_density(fill = "grey50",
+                   color = "grey30")
+    } else {
+      geom_density(aes(fill = .data[[fill]]),
+                   color = "grey10",
+                   alpha = 0.5,
+                   show.legend = show.legend)
+    }}+
+    {if(max(metadata[[var]])>100){
+          scale_x_log10()}} +
+    {if(!all(is.na(cutoffs[[var]]))){
+      geom_vline(xintercept = cutoffs[[var]],
+                 color = "red",
+                 linetype="dashed")}} +
+    {if(split){
+      facet_wrap(~ .data[[fill]])}} +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+}
+```
+
+
+```{r qc_violin}
+qclist <- lapply(names(qc_thresholds), function(c){  # names of QC metrics to evaluate
+  qc_plot(seu@meta.data, var=c, cutoffs = qc_thresholds)
+})
+qclist
+```
+
+## QC filtering
+
+Apply standard QC thresholds:
+
+```{r qc_filter}
+# Store initial cell count
+n_cells_initial <- ncol(seu)
+
+# Apply filtering
+seu <- subset(
+  seu,
+  subset = 
+    nFeature_RNA >= qc_thresholds$nFeature_RNA["min"] &
+    nFeature_RNA < qc_thresholds$nFeature_RNA["max"] &
+    nCount_RNA >= qc_thresholds$nCount_RNA["min"] &
+    nCount_RNA < qc_thresholds$nCount_RNA["max"] &
+    percent_mito >= qc_thresholds$percent_mito["min"] &
+    percent_mito < qc_thresholds$percent_mito["max"] &
+    percent_ribo >= qc_thresholds$percent_ribo["min"] &
+    percent_ribo < qc_thresholds$percent_ribo["max"] &
+    log10_genes_per_umi > qc_thresholds$log10_genes_per_umi
+)
+
+n_cells_filtered <- ncol(seu)
+pct_retained <- 100 * n_cells_filtered / n_cells_initial
+
+cat("QC filtering complete\n")
+cat("Initial cells:", n_cells_initial, "\n")
+cat("Filtered cells:", n_cells_filtered, "\n")
+cat("Retained:", sprintf("%.1f%%", pct_retained), "\n")
+```
+
+## Remove small samples
+
+```{r remove_small_samples}
+# Remove samples with fewer than minimum cells
+seu@meta.data <- seu@meta.data %>% 
+  dplyr::rename("Sample_ID" = "sample_id")
+sample_id <- "Sample_ID"
+tab <- table(seu@meta.data[[sample_id]])
+keep_samples <- names(tab)[tab > min_cells_per_sample]
+
+n_samples_before <- length(unique(seu@meta.data[[sample_id]]))
+seu <- subset(seu, Sample_ID %in% keep_samples)
+n_samples_after <- length(unique(seu@meta.data[[sample_id]]))
+
+cat("Samples before:", n_samples_before, "\n")
+cat("Samples after (removed small samples):", n_samples_after, "\n")
+cat("Total cells:", ncol(seu), "\n")
+```
+
+## Normalize data
+
+```{r normalize_data}
+seu <- NormalizeData(seu)
+cat("Data normalized\n")
+```
+
+---
+
+# Save processed object
+
+```{r save_object}
+# Save the merged, filtered, standardized object
+output_file <- file.path("cache", paste0(ds_name, ".rds"))
+saveRDS(seu, output_file)
+cat("Processed Oh object saved to:", output_file, "\n")
+cat("Final object dimensions:", nrow(seu), "genes x", ncol(seu), "cells\n")
+```
+
+---
+
+## Session info
+
+```{r session_info}
+sessionInfo()
+```
+
