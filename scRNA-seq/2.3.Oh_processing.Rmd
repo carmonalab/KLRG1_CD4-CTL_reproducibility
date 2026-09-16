@@ -178,20 +178,55 @@ cat("QC metrics calculated\n")
 ```
 
 ## Visualize QC metrics before filtering
-
-```{r qc_violin, fig.height=12, fig.width=7}
-# Set sample identity for visualization
-Idents(seu) <- "orig.ident"
-
-# Violin plot of QC metrics
-VlnPlot(
-  seu,
-  features = c("nFeature_RNA", "nCount_RNA",
-               "percent_mito", "percent_ribo",
-               "log10_genes_per_umi"),
-  ncol = 2,
-  pt.size = 0
+```{r qc_thresholds}
+qc_thresholds <- list(
+  nFeature_RNA = c(min = 200, max = 2000),
+  nCount_RNA = c(min = 600, max = 3000),
+  percent_mito = c(min = 0, max = 5),
+  percent_ribo = c(min = 5, max = 40),
+  log10_genes_per_umi = 0.7
 )
+
+## QC metrics distribution
+qc_plot <- function(metadata, #seurat object metadata
+                    var, # QC variables to plot
+                    cutoffs,  # list of cutoffs with same names as QC vars
+                    fill = NULL, # groupin variable for density plots
+                    show.legend = T,
+                    split = F
+                    ) {
+  
+
+  metadata %>%
+    ggplot(aes(.data[[var]])) +
+    {if(is.null(fill)){
+      geom_density(fill = "grey50",
+                   color = "grey30")
+    } else {
+      geom_density(aes(fill = .data[[fill]]),
+                   color = "grey10",
+                   alpha = 0.5,
+                   show.legend = show.legend)
+    }}+
+    {if(max(metadata[[var]])>100){
+          scale_x_log10()}} +
+    {if(!all(is.na(cutoffs[[var]]))){
+      geom_vline(xintercept = cutoffs[[var]],
+                 color = "red",
+                 linetype="dashed")}} +
+    {if(split){
+      facet_wrap(~ .data[[fill]])}} +
+    theme_bw() +
+    theme(aspect.ratio = 1)
+}
+```
+
+
+```{r qc_violin}
+qclist <- lapply(names(qc_thresholds), function(c){  # names of QC metrics to evaluate
+  qc_plot(seu@meta.data, var=c, cutoffs = qc_thresholds)
+})
+qclist
 ```
 
 ## QC filtering
@@ -201,15 +236,6 @@ Apply standard QC thresholds:
 ```{r qc_filter}
 # Store initial cell count
 n_cells_initial <- ncol(seu)
-
-# Define QC thresholds
-qc_thresholds <- list(
-  nFeature_RNA = c(min = 200, max = 6000),
-  nCount_RNA = c(min = 600, max = 10000),
-  percent_mito = c(min = 0, max = 5),
-  percent_ribo = c(min = 0, max = 60),
-  log10_genes_per_umi = 0.7
-)
 
 # Apply filtering
 seu <- subset(
@@ -265,7 +291,7 @@ cat("Data normalized\n")
 
 ```{r save_object}
 # Save the merged, filtered, standardized object
-output_file <- file.path(data_dir, paste0(ds_name, "_whole.rds"))
+output_file <- file.path("cache", paste0(ds_name, ".rds"))
 saveRDS(seu, output_file)
 cat("Processed Oh object saved to:", output_file, "\n")
 cat("Final object dimensions:", nrow(seu), "genes x", ncol(seu), "cells\n")
