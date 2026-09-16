@@ -19,7 +19,7 @@ for integration with the KLRG1 CD4-CTL reproducibility project. The script:
 - **title**: Intratumoral CD4+ T Cells Mediate Anti-tumor Cytotoxicity in Human Bladder Cancer
 - **doi**: https://doi.org/10.1016/j.cell.2020.05.017
 - **Data source**: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149652
-- **Output**: `scRNA-seq/cache/Oh_2020_32497499_whole.rds` (CD4+, high-quality cells)
+- **Output**: `scRNA-seq/cache/Oh_2020_32497499.rds` (CD4+, high-quality cells)
 
 ---
 
@@ -106,6 +106,8 @@ Data downloaded from https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE14965
 # 2 - Load data
 
 ## Load data
+
+We'll use only CD4+ T cell data
 
 ```{r load_raw_data}
 # annotation column
