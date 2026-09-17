@@ -1,0 +1,100 @@
+---
+title: "Cross-dataset CTL CD4+ T cells comparison"
+author: "Josep Garnica <josep.garnicacaparros@unige.ch>"
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    self_contained: true
+    toc: true
+    toc_depth: 3
+    code_folding: show
+---
+
+# Context
+In JEM revision, R3 in point 2 pointed:
+
+*Many prior studies have also identified CD4 T cells with cytotoxic features (e.g. PMID: 41043413, PMID: 40299576, PMID: 39655805, and others). It would be valuable if the authors could compare the population identified in this study with previously described cytotoxic CD4 T cell subsets in cancer and other diseases, particularly in terms of their phenotypic and functional overlap.*
+
+We tried to fetch these datasets but either data was not accessible or authors did not share annotation. We could only collect 2 datasets:
+
+### 40299576
+   - Actually proposed by reviewer
+   - Paper: https://insight.jci.org/articles/view/177373
+   Identification and regulation of circulating tumor-TCR-matched cytotoxic CD4+ lymphocytes by KLRG1 in bladder cancer
+   - Data source: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE293860
+   * Processed (cached): `2.3.Oh_processing.Rmd`
+   
+### 32497499
+Proposed an extra dataset by Camila
+Intratumoral CD4+ T Cells Mediate Anti-tumor Cytotoxicity in Human Bladder Cancer
+https://doi.org/10.1016/j.cell.2020.05.017
+- Data source: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149652
+* Processed (cached): `2.4.Kwek_processing.Rmd`
+
+
+# Goals
+- Signature overlap and label-transfer comparison against these published cytotoxic CD4 datasets.
+- Add heatmap of conserved and unique markers.
+
+
+# 0 - Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 7,
+  echo = TRUE
+)
+```
+
+
+## Reproducible R environment (recommended)
+
+To reproduce the exact software environment used for this analysis,
+restore packages from the repository `renv.lock` file before running
+the pipeline.
+
+```{r renv-restore, eval=FALSE}
+# Run once from the repository root
+install.packages("renv")
+renv::restore(prompt = FALSE)
+```
+
+## Load and attach packages
+
+```{r load_packages, message=FALSE}
+library(here)
+library(tidyverse)
+library(Seurat)
+library(STACAS)
+library(SignatuR)
+library(BiocParallel)
+library(UCell)
+```
+
+# 1. Load processed datasets
+
+These were harmonized, QC filtered and normalized in `2.3.Oh_processing.Rmd` and `2.4.Kwek_processing.Rmd`, respectively. 
+
+In both, author's annotation are in `cell_types` and sample_id in `Sample_ID`.
+
+```{r ident_sampleid}
+author_annotation <- "cell_type"
+sample_id <- "Sample_ID"
+```
+
+Load Seurat into a list to run all code in loops
+```{r load_seurat}
+file_path <- c("cache/Oh_2020_32497499.rds",
+               "cache/Kwek_2025_39655805.rds")
+seu_list <- bplapply(file_path,
+                     BPPARAM = MulticoreParam(workers = 2, progressbar = T),
+                     function(f){
+                        readRDS(f)
+                     })
+```
+
+
+
