@@ -69,6 +69,7 @@ library(here)
 library(tidyverse)
 library(Seurat)
 library(STACAS)
+library(ProjecTILs)
 library(SignatuR)
 library(BiocParallel)
 library(UCell)
@@ -81,11 +82,11 @@ These were harmonized, QC filtered and normalized in `2.3.Oh_processing.Rmd` and
 In both, author's annotation are in `cell_types` and sample_id in `Sample_ID`.
 
 ```{r ident_sampleid}
-author_annotation <- "cell_type"
+author_annotation <- "cell_types"
 sample_id <- "Sample_ID"
 ```
 
-Load Seurat into a list to run all code in loops
+## Load Seurat into a list to run all code in loops
 ```{r load_seurat}
 file_path <- c("cache/Oh_2020_32497499.rds",
                "cache/Kwek_2025_39655805.rds")
@@ -94,7 +95,344 @@ seu_list <- bplapply(file_path,
                      function(f){
                         readRDS(f)
                      })
+names(seu_list) <- tools::file_path_sans_ext(basename(file_path))  
 ```
+
+What CD4T subtypes are annotated?
+
+```{r}
+lapply(seu_list, function(s){
+  s@meta.data[[author_annotation]] %>% unique()
+})
+lapply(seu_list, function(s){
+  s@meta.data[[sample_id]] %>% unique()
+})
+```
+
+# 2. Annotate and project with inhouse data and ProjecTILs ref maps
+
+## Load inhouse dataset and reference
+```{r}
+ref_paths <- c("cache/cd4_total_integrated_manual.rds", # produced in script 1.2.Integration_annotation.Rmd
+               "cache/CD4T_human_ref_v2.rds")
+ref <- bplapply(ref_paths,
+                BPPARAM = MulticoreParam(workers = 2, progressbar = T),
+                function(f){
+                  readRDS(f)
+                })
+names(ref) <- c("inhouse", "ProjecTILs")
+
+# inhouse dataset should be converted to projectils ref map for later classification
+ref$inhouse <- make.reference(
+  ref = ref$inhouse ,
+  assay = "integrated",
+  ndim = 50,
+  seed = 22,
+  recalculate.umap = FALSE,
+  nfeatures = 1500,
+  annotation.column = "annotation"
+)
+```
+
+```{r}
+lapply(ref, function(x){
+  if("functional.cluster" %in% colnames(x@meta.data)){
+    gb <- "functional.cluster"
+  } else {
+    gb <- "annotation"
+  }
+  DimPlot(x,
+          group.by = gb)
+})
+```
+
+## Annotate
+
+```{r}
+seu_list <- lapply(seu_list,
+                   function(s){
+                     
+  s <- ProjecTILs.classifier(query = s,
+                             ref = ref$inhouse,
+                             filter.cells = F,
+                             labels.col = "annotation",
+                             split.by = sample_id,
+                             ncores = 7)
+  s$pred_inhouse <- s$annotation
+  
+  s <- ProjecTILs.classifier(query = s,
+                             ref = ref$ProjecTILs,
+                             filter.cells = F,
+                             labels.col = "functional.cluster",
+                             split.by = sample_id,
+                             ncores = 7)
+  s$pred_ProjecTILs <- s$functional.cluster
+  
+  return(s)
+})
+```
+
+
+# 3. Plot confusion matrix plots
+Show the agreement between author's annotation and the projection of our manual annotation, spepecially for inhouse dataset.
+
+
+
+```{r confusion_plot, fig.width=10, fig.height=5}
+source("utils/confusion_plot.R")
+conf_plot <- lapply(names(seu_list), function(s){
+  plot.confusion(object = seu_list[[s]],
+                 var.1 = author_annotation,
+                 var.2 = "pred_inhouse",
+                 ylab = "Prediction",
+                 xlab = "Author's annotation",
+                 plot.title = s,
+                 type = "tile",
+                 relative = T)
+})
+conf_plot
+```
+
+# 4. Signatures
+
+We reproduce heatmap done in `2.2.Annotatoin_multicancer_dataset.Rmd` and corresponding to Suppl Figure 1G.
+
+Define the main cd4-ctl and thf markers
+
+```{r define_markers}
+cd4_cytotoxic_markers <- c("GZMB", "GNLY", "NKG7", "FGFBP2", "PRF1", "CST7", "GZMA",
+                           "GZMH", "CTSW")
+tfh_markers <- c("CXCR5", "PDCD1", "CXCL13", "IL21", "TOX")
+feats_heatmap <- c(cd4_cytotoxic_markers, tfh_markers)
+# define which cell types to fetch
+sel_ct <- "cytotoxic|tfh|cxcl13|gzmb|gzmk"
+sel_ct <- "cytotoxic|gzmb|gzmk"
+```
+
+## Join query datasets and inhouse dataset into the same object
+```{r}
+# add dataset of origin
+seu_list <- lapply(names(seu_list), function(s){
+  seu_list[[s]]$dataset <- s
+  return(seu_list[[s]])
+})
+```
+
+```{r}
+ref$inhouse@meta.data[[sample_id]] <- ref$inhouse$MULTI_classification
+ref$inhouse@meta.data[[author_annotation]] <- ref$inhouse$annotation
+ref$inhouse@meta.data[["dataset"]] <- "ThiStudy"
+```
+
+```{r}
+mer <- merge(ref$inhouse, seu_list)
+# subset only for CTL and TFH-like cells
+mer <- mer[,grepl(sel_ct, mer@meta.data[[author_annotation]], ignore.case = T)]
+table(mer[[author_annotation]])
+```
+## Heatmap per sample
+
+### Build pseudobulk
+
+```{r}
+# Raw counts
+counts <- GetAssayData(mer, assay = "RNA", layer = "counts")
+# Group cells by sample + cell type
+group <- interaction(
+  mer@meta.data[[sample_id]],
+  mer@meta.data[[author_annotation]],
+  mer@meta.data$dataset,
+  sep = "--",
+  drop = TRUE
+)
+# Pseudobulk: sum raw counts within each sample × cell type
+counts_pb <- sapply(
+  levels(group),
+  function(g) {
+    Matrix::rowSums(counts[, group == g, drop = FALSE])
+  }
+)
+counts_pb <- Matrix::Matrix(counts_pb, sparse = TRUE)
+# Clean group names
+colnames(counts_pb) <- levels(group)
+# Log-normalize
+counts_pb_log <- log1p(
+  t(t(counts_pb) / Matrix::colSums(counts_pb) * 1e4)
+)
+
+```
+
+
+```{r}
+library(pheatmap)
+
+ann_col <- data.frame(id = colnames(counts_pb_log)) %>% 
+  separate(
+    id,
+    sep = "--",
+    into = c("sample_id", "cell_type", "dataset"),
+    remove = FALSE
+  ) %>% 
+  select(-sample_id) %>% 
+  arrange(desc(dataset), cell_type) %>%
+  mutate(
+    cell_type = factor(
+      cell_type,
+      levels = unique(cell_type)
+    )
+  ) %>%
+  tibble::column_to_rownames("id")
+
+mat <- counts_pb_log[cd4_cytotoxic_markers,rownames(ann_col)]
+
+pheatmap(mat = mat,
+         scale = "row",
+         cluster_cols = F,
+         cluster_rows = F,
+         show_colnames = F, 
+         annotation_col = ann_col
+         )
+```
+
+
+# 5. Markers overlaps
+
+### Findmarkers
+```{r}
+# get commone set of features in 3 seurat object
+DefaultAssay(ref$inhouse) <- "RNA"
+common_feats <- Reduce(
+  intersect,
+  list(
+    Features(seu_list$Oh_2020_32497499),
+    Features(seu_list$Kwek_2025_39655805),
+    Features(ref$inhouse)
+  )
+)
+# remove also tcr and hla genes
+common_feats <- common_feats[
+  !grepl(
+    "^(TR[ABDG][VCJ]|HLA-)",
+    common_feats
+  )
+]
+
+top_genes <- 25
+scmarkers <- lapply(c(seu_list, ref$inhouse),
+  function(s) {
+    # combine cytotoxic cells
+    ctl_annot <- paste0("CD4-CTL_", unique(s$dataset))
+    s$new_annot <- ifelse(grepl(sel_ct, s@meta.data[[author_annotation]], ignore.case = T),
+                          ctl_annot, 
+                          as.character(s@meta.data[[author_annotation]]))
+    naive_annot <- grep("memory|CM", s@meta.data[[author_annotation]],
+                        ignore.case = T, value = T) %>% unique()
+    cat("Dataset: ", unique(s$dataset), "\n",
+          "Comparing ", unique(grep("cytotoxic|gzmb",
+                                    s@meta.data[[author_annotation]],
+                                    ignore.case = T, value = T)),
+          " vs ", naive_annot)
+    
+    Idents(s) <- "new_annot"
+    m <- FindMarkers(
+      s,
+      ident.1 = ctl_annot,
+      ident.2 = naive_annot,
+      assay = "RNA",
+      features = common_feats,
+      test.use = "bimod",
+      min.pct = 0.3,
+      min.diff.pct = 0.1,
+      min.cells.feature = 10,
+      verbose = FALSE,
+      only.pos = TRUE
+    )
+    
+    m <- m %>% 
+      arrange(desc(avg_log2FC)) %>% 
+      head(top_genes) %>% 
+      mutate(dataset = unique(s$dataset)) %>% 
+      tibble::rownames_to_column("gene")
+    
+    return(m)
+  }
+) %>% 
+  data.table::rbindlist()
+```
+
+```{r}
+table(scmarkers$dataset) %>% sort()
+```
+
+## Upset plot
+
+```{r}
+marker_sets <- scmarkers %>%
+  group_by(dataset) %>%
+  summarise(
+    genes = list(unique(gene)),
+    .groups = "drop"
+  )
+
+marker_list <- setNames(marker_sets$genes, marker_sets$dataset)
+```
+
+```{r}
+marker_df0 <- tibble(
+  gene = unique(unlist(marker_list))
+)
+
+for (ct in names(marker_list)) {
+  marker_df0[[ct]] <- marker_df0$gene %in% marker_list[[ct]]
+}
+
+marker_df0
+```
+
+
+```{r}
+library(UpSetR)
+
+# Convert list of gene sets to UpSetR input
+marker_df <- fromList(marker_list)
+
+# Plot overlap
+up <- upset(
+  marker_df,
+  sets = names(marker_list),
+  keep.order = TRUE,
+  order.by = "freq",
+  nsets = length(marker_list),
+  nintersects = NA
+)
+up
+```
+
+
+
+## Euler's plot
+
+```{r}
+library(eulerr)
+
+fit <- euler(marker_list)
+
+plot(
+  fit,
+  quantities = list(
+    fontsize = 10,
+    col = "black"
+  ),
+  labels = list(
+    fontsize = 11
+  ),
+  edges = TRUE
+)
+```
+
+
+
+
 
 
 
