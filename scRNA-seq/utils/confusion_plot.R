@@ -49,7 +49,7 @@ plot.confusion <- function(object = NULL,
    
    if (relative) {
       pz <- prop.table(pz, margin = 1) %>%
-         round(digits = 2)
+         round(digits = 5)
       legend.title <- "Proportion of cells"
    }
    
@@ -67,7 +67,7 @@ plot.confusion <- function(object = NULL,
                        y = ylab,
                        title = plot.title) +
          ggplot2::geom_label(ggplot2::aes(label = ifelse(Freq > 0,
-                                                         round(Freq, 1),
+                                                         round(Freq, 2),
                                                          NA)),
                              color = "white",
                              alpha = 0.6,
