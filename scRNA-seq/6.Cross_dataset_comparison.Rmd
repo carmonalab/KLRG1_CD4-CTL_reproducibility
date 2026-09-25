@@ -113,14 +113,15 @@ lapply(seu_list, function(s){
 
 ## Load inhouse dataset and reference
 ```{r}
-ref_paths <- c("cache/cd4_total_integrated_manual.rds", # produced in script 1.2.Integration_annotation.Rmd
-               "cache/CD4T_human_ref_v2.rds")
+ref_paths <- list("inhouse" = "cache/cd4_total_integrated_manual.rds" 
+                  # produced in script 1.2.Integration_annotation.Rmd
+               #"ProjecTILs" = cache/CD4T_human_ref_v2.rds")
+)
 ref <- bplapply(ref_paths,
                 BPPARAM = MulticoreParam(workers = 2, progressbar = T),
                 function(f){
                   readRDS(f)
                 })
-names(ref) <- c("inhouse", "ProjecTILs")
 
 # inhouse dataset should be converted to projectils ref map for later classification
 ref$inhouse <- make.reference(
@@ -132,6 +133,7 @@ ref$inhouse <- make.reference(
   nfeatures = 1500,
   annotation.column = "annotation"
 )
+
 ```
 
 ```{r}
@@ -159,14 +161,14 @@ seu_list <- lapply(seu_list,
                              split.by = sample_id,
                              ncores = 7)
   s$pred_inhouse <- s$annotation
-  
-  s <- ProjecTILs.classifier(query = s,
-                             ref = ref$ProjecTILs,
-                             filter.cells = F,
-                             labels.col = "functional.cluster",
-                             split.by = sample_id,
-                             ncores = 7)
-  s$pred_ProjecTILs <- s$functional.cluster
+  # 
+  # s <- ProjecTILs.classifier(query = s,
+  #                            ref = ref$ProjecTILs,
+  #                            filter.cells = F,
+  #                            labels.col = "functional.cluster",
+  #                            split.by = sample_id,
+  #                            ncores = 7)
+  # s$pred_ProjecTILs <- s$functional.cluster
   
   return(s)
 })
@@ -195,18 +197,20 @@ conf_plot
 
 # 4. Signatures
 
+## 4.1 Gene expression
+
 We reproduce heatmap done in `2.2.Annotatoin_multicancer_dataset.Rmd` and corresponding to Suppl Figure 1G.
 
 Define the main cd4-ctl and thf markers
 
 ```{r define_markers}
 cd4_cytotoxic_markers <- c("GZMB", "GNLY", "NKG7", "FGFBP2", "PRF1", "CST7", "GZMA",
-                           "GZMH", "CTSW")
+                           "GZMH", "CTSW", "KLRG1")
 tfh_markers <- c("CXCR5", "PDCD1", "CXCL13", "IL21", "TOX")
 feats_heatmap <- c(cd4_cytotoxic_markers, tfh_markers)
 # define which cell types to fetch
-sel_ct <- "cytotoxic|tfh|cxcl13|gzmb|gzmk"
-sel_ct <- "cytotoxic|gzmb|gzmk"
+sel_ct <- "cytotoxic|tfh|cxcl13|gzmb|gzmk" # ctl and tfh
+sel_ct <- "cytotoxic|gzmb|gzmk" # only ctl
 ```
 
 ## Join query datasets and inhouse dataset into the same object
@@ -216,19 +220,39 @@ seu_list <- lapply(names(seu_list), function(s){
   seu_list[[s]]$dataset <- s
   return(seu_list[[s]])
 })
+names(seu_list) <- tools::file_path_sans_ext(basename(file_path)) 
 ```
 
 ```{r}
 ref$inhouse@meta.data[[sample_id]] <- ref$inhouse$MULTI_classification
 ref$inhouse@meta.data[[author_annotation]] <- ref$inhouse$annotation
 ref$inhouse@meta.data[["dataset"]] <- "ThiStudy"
+ref$inhouse$treatment <- "Untreated"
+
+# accomodate metadata
+seu_list$Oh_2020_32497499$treatment <- factor(seu_list$Oh_2020_32497499$treatment,
+                                              levels = c("Atezo", "Chemo", "None"),,
+                                              labels = c("antiPDL1", "Chemo", "Untreated"))
+seu_list$Kwek_2025_39655805$treatment <- case_when(
+                                                   grepl("untreated", seu_list$Kwek_2025_39655805$title) ~ "Untreated",
+                                                   grepl("chemo", seu_list$Kwek_2025_39655805$title) ~ "Chemo",
+                                                   grepl("pdl1", seu_list$Kwek_2025_39655805$title) ~ "antiPDL1",
+                                                   grepl("healthy", seu_list$Kwek_2025_39655805$title) ~ "Healthy"
+                                                   )
+seu_list$Kwek_2025_39655805$tissue <- case_when(
+                                                   grepl("normal", seu_list$Kwek_2025_39655805$title) ~ "Normal",
+                                                   grepl("blood", seu_list$Kwek_2025_39655805$title) ~ "PBMC",
+                                                   grepl("tumor", seu_list$Kwek_2025_39655805$title) ~ "Tumor"
+                                                   )
 ```
 
 ```{r}
-mer <- merge(ref$inhouse, seu_list)
+allmer <- merge(ref$inhouse, seu_list)
 # subset only for CTL and TFH-like cells
-mer <- mer[,grepl(sel_ct, mer@meta.data[[author_annotation]], ignore.case = T)]
+mer <- allmer[,grepl(sel_ct, allmer@meta.data[[author_annotation]], ignore.case = T)]
 table(mer[[author_annotation]])
+table(mer$tissue, mer$dataset, useNA = "ifany")
+table(mer$treatment, mer$dataset, useNA = "ifany")
 ```
 ## Heatmap per sample
 
@@ -290,9 +314,161 @@ pheatmap(mat = mat,
          cluster_cols = F,
          cluster_rows = F,
          show_colnames = F, 
-         annotation_col = ann_col
+         annotation_col = ann_col,
+         main = "Cytotoxic markers in CD4-T Cytotoxic-like populations\nPseudobulk per sample",
          )
 ```
+
+## 4.2 Signature scoring
+
+```{r}
+DefaultAssay(allmer) <- "RNA"
+DefaultAssay(ref$inhouse) <- "RNA"
+# check if some dataset do not some gene of the signature
+common_feats_ctl <- Reduce(
+  intersect,
+  list(
+    Features(seu_list$Oh_2020_32497499),
+    Features(seu_list$Kwek_2025_39655805),
+    Features(ref$inhouse),
+    cd4_cytotoxic_markers
+  )
+)
+
+allmer <- AddModuleScore_UCell(allmer,
+                            features = list(Cytotoxic = cd4_cytotoxic_markers),
+                            name = "",
+                            ncores = 7)
+```
+
+Tidy dataframe & plotting
+
+```{r score_plot_all_ct}
+udf <- allmer@meta.data %>% 
+  group_by(.data[[sample_id]], .data[[author_annotation]],
+         tissue, treatment, dataset) %>% 
+  summarize(Cytotoxic_score = mean(Cytotoxic))
+  
+# plot
+upl <- udf %>% 
+  ggplot(aes(.data[[author_annotation]], Cytotoxic_score,
+             fill = .data[[author_annotation]])) +
+  geom_boxplot(
+    outlier.color = NA,
+    show.legend = FALSE,
+    alpha = 0.4
+  ) +
+  geom_jitter(
+    color = "grey22",
+    show.legend = FALSE,
+    shape = 21,
+    width = 0.1,
+    alpha = 0.8
+  ) +
+  labs(
+    x = "Cell type annotation",
+    y = "UCell score",
+    title = "Gene signature scoring - Mean per sample"
+  ) +
+  facet_wrap(~dataset,
+             scales = "free_x") +
+  ggpubr::theme_classic2() +
+    theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+
+upl
+```
+
+```{r score_plot_ctl}
+cdf <- allmer@meta.data %>% 
+  filter(grepl(sel_ct, .data[[author_annotation]], ignore.case = T)) %>% 
+  group_by(.data[[sample_id]], .data[[author_annotation]],
+           tissue, treatment, dataset) %>% 
+  summarize(Cytotoxic_score = mean(Cytotoxic), .groups = "drop") %>% 
+  ungroup() %>% 
+  mutate(cell_types = factor(.data[[author_annotation]],
+                                             levels = c("Cytotoxic","CD4GZMB",
+                                                        "CD4GZMK", "GZMB+","GZMK+"))
+         )
+
+comps <- list(c("Cytotoxic", "CD4GZMB"),
+              c("Cytotoxic", "CD4GZMK"),
+              c("Cytotoxic", "GZMB+"),
+              c("Cytotoxic", "GZMK+")
+              )
+  
+# plot
+cpl <- cdf %>% 
+  ggplot(aes(.data[[author_annotation]], Cytotoxic_score,
+             fill = dataset)) +
+  geom_boxplot(
+    outlier.color = NA,
+    alpha = 0.4
+  ) +
+  geom_jitter(
+    color = "grey22",
+    show.legend = FALSE,
+    shape = 21,
+    width = 0.1,
+    alpha = 0.8
+  ) +
+  ggpubr::stat_compare_means(
+    comparisons = comps,
+    method = "wilcox.test",
+    label = "p.format"
+  ) +
+  labs(
+    x = "Cell type annotation",
+    y = "UCell score",
+    title = "Gene signature scoring of cytotoxic-like types",
+    subtitle = "Mean per sample"
+  ) +
+  ggpubr::theme_classic2() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+
+cpl
+```
+
+```{r}
+tpl <- cdf %>% 
+  ggplot(aes(.data[[author_annotation]], Cytotoxic_score,
+             fill = treatment)) +
+  geom_boxplot(
+    outlier.color = NA,
+    alpha = 0.4,
+    position = position_dodge(width = 0.8)
+  ) +
+  # geom_point(
+  #   aes(group = tissue),
+  #   color = "grey22",
+  #   show.legend = FALSE,
+  #   shape = 21,
+  #   alpha = 0.8,
+  #   position = position_jitterdodge(
+  #     jitter.width = 0.1,
+  #     dodge.width = 0.8
+  #   )
+  # ) +
+  labs(
+    x = "Cell type annotation",
+    y = "UCell score",
+    title = "Gene signature scoring of cytotoxic-like types",
+    subtitle = "Mean per sample"
+  ) +
+  facet_wrap(~tissue) +
+  ggpubr::theme_classic2() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1, vjust = 1)
+  )
+
+tpl
+```
+
+
+
 
 
 # 5. Markers overlaps
@@ -328,10 +504,10 @@ scmarkers <- lapply(c(seu_list, ref$inhouse),
     naive_annot <- grep("memory|CM", s@meta.data[[author_annotation]],
                         ignore.case = T, value = T) %>% unique()
     cat("Dataset: ", unique(s$dataset), "\n",
-          "Comparing ", unique(grep("cytotoxic|gzmb",
+          "Comparing ", unique(grep(sel_ct,
                                     s@meta.data[[author_annotation]],
                                     ignore.case = T, value = T)),
-          " vs ", naive_annot)
+          " vs ", naive_annot, "\n")
     
     Idents(s) <- "new_annot"
     m <- FindMarkers(
@@ -376,6 +552,44 @@ marker_sets <- scmarkers %>%
 
 marker_list <- setNames(marker_sets$genes, marker_sets$dataset)
 ```
+
+```{r}
+# Unique markers for each set
+unique_markers <- lapply(names(marker_list), function(x) {
+  others <- setdiff(names(marker_list), x)
+  setdiff(
+    marker_list[[x]],
+    unique(unlist(marker_list[others]))
+  )
+})
+names(unique_markers) <- names(marker_list)
+
+# Pairwise intersections
+pairwise_intersections <- list(
+  Kwek_Oh = intersect(
+    marker_list$Kwek_2025_39655805,
+    marker_list$Oh_2020_32497499
+  ),
+  Kwek_ThiStudy = intersect(
+    marker_list$Kwek_2025_39655805,
+    marker_list$ThiStudy
+  ),
+  Oh_ThiStudy = intersect(
+    marker_list$Oh_2020_32497499,
+    marker_list$ThiStudy
+  )
+)
+
+# Intersection of all three
+three_way_intersection <- Reduce(intersect, marker_list)
+
+unique_markers
+pairwise_intersections
+three_way_intersection
+
+clipr::write_clip(paste(pairwise_intersections$Oh_ThiStudy, collapse = ", "))
+```
+
 
 ```{r}
 marker_df0 <- tibble(
@@ -430,9 +644,218 @@ plot(
 )
 ```
 
+# 6. scTypeEval
+
+Try to use confusion/heatmap plot to evaluate correspondance of different annotations
+
+```{r}
+get_features_filtered <- function(seu,
+                                  sel_ct = "cytotoxic|gzmb|gzmk",
+                                  min_row = 50){
+  seu <- seu[, grepl(sel_ct,
+                     seu@meta.data[[author_annotation]],
+                     ignore.case = TRUE)]
+  
+  counts <- Seurat::GetAssayData(seu, layer = "counts")
+  keep_genes <- Matrix::rowSums(counts) > min_row
+  
+  rownames(counts)[keep_genes]
+}
+DefaultAssay(ref$inhouse) <- "RNA"
+
+common_feats_ct <- Reduce(
+  intersect,
+  list(
+    get_features_filtered(seu_list$Oh_2020_32497499),
+    get_features_filtered(seu_list$Kwek_2025_39655805),
+    get_features_filtered(ref$inhouse)
+  )
+)
+
+mer <- allmer[,grepl("cytotoxic|gzmb|gzmk", allmer@meta.data[[author_annotation]], ignore.case = T)]
+```
+
+
+```{r}
+library(scTypeEval)
+DefaultAssay(mer)
+data(black_list)
+bl <- list(black_list$TCR,
+           black_list$Immunoglobulins,
+           black_list$Ygenes) |>
+       unlist()
+
+gene_list <- list(common_feats = common_feats_ct)
+
+sceval <- create_scTypeEval(allmer,
+                            black_list = bl,
+                            gene_lists = gene_list)
+add_extra_gl <- T
+
+sceval <- run_processing_data(
+  scTypeEval = sceval,
+  ident = author_annotation,        
+  sample = sample_id,  
+  min_samples = 1, 
+  min_cells = 4
+)
+
+if(add_extra_gl){
+  sceval <- run_hvg(
+    scTypeEval = sceval,
+    var_method = "scran",
+    ngenes = 2000,
+    sample = TRUE, 
+    ncores = 6 
+  )
+  
+  # Identify marker genes per cell type
+  sceval <- run_gene_markers(
+    scTypeEval = sceval,
+    method = "scran.findMarkers",
+    ngenes_celltype = 100,
+    ncores = 6    
+  )
+}
+
+diss <- c("recip_classif:Match", "Pseudobulk:Cosine",
+          "Pseudobulk:Pearson")
+for(d in diss){
+  sceval <- run_dissimilarity(sceval,
+                       method = d,
+                       reduction = F,
+                       ncores = 6,
+                       gene_list = "common_feats")
+}
+```
+
+```{r}
+plot_heatmap(sceval,
+             dissimilarity_slot = "recip_classif:Match",
+             sort_similarity = "Pseudobulk:Cosine")
+```
+
+
+
+## custom cosine heatmap
+
+```{r}
+d <- c("Pseudobulk:Pearson","Pseudobulk:Cosine")[1]
+mat <- sceval@dissimilarity[[d]]@dissimilarity %>% as.matrix()
+# get back cosine similarity
+mat <- 1 - mat
+
+mph <- data.frame(id = colnames(mat)) %>% 
+  separate(id, sep = "_", into = c("Sample_ID", "cell_types"), remove = F) %>% 
+  left_join(.,
+            sceval@metadata %>%
+              distinct(Sample_ID, dataset) %>% 
+              mutate(Sample_ID = scTypeEval:::purge_label(Sample_ID)),
+            by = "Sample_ID") %>% 
+  tibble::column_to_rownames("id") %>% 
+  select(-Sample_ID) %>% 
+  arrange(dataset, cell_types)
+
+mat <- mat[rownames(mph),rownames(mph)]
+phc <- pheatmap(mat = mat,
+                cluster_rows = F,
+                cluster_cols = F,
+                show_rownames = F,
+                show_colnames = F,
+                annotation_row = mph,
+                main = "Pearson correlation - Common genes across datasets")
+```
+
+```{r}
+feats <- sceval@gene_lists$scran.findMarkers
+mat <- sceval@data$pseudobulk@matrix[feats,]
+
+phc <- pheatmap(mat = mat,
+                scale = "row",
+                cluster_rows = T,
+                cluster_cols = F,
+                show_rownames = T,
+                show_colnames = F,
+                annotation_col = mph,
+                main = "Cell type markers expression\nPseudobulk per sample")
+```
+
+
+
+# 7. MetaNeighbor
+
+```{r}
+library(MetaNeighbor)
+mer0 <- allmer
+mer0[["HTG"]] <- NULL
+mer0[["integrated"]] <- NULL
+sce <- as.SingleCellExperiment(mer0)
+
+global_hvgs = variableGenes(dat = sce,
+                            exp_labels = sce$dataset)
+length(global_hvgs)
+```
+## Auroc heatmap
+```{r}
+aurocs <- MetaNeighborUS(var_genes = global_hvgs,
+                         dat = sce,
+                         study_id = sce$dataset,
+                         cell_type = sce$cell_types,
+                         fast_version = TRUE, 
+                         symmetric_output = TRUE)
+```
+
+```{r}
+plotHeatmap(aurocs, cex = 0.5)
+```
+
+
+## tophits
+
+```{r}
+top_hits <- topHits(aurocs,
+                    dat = sce,
+                    study_id = sce$dataset,
+                    cell_type = sce$cell_types,
+                    threshold = 0.5)
+
+top_hit_study <- topHitsByStudy(
+  aurocs,
+  threshold = 0.8,
+  n_digits = 2,
+  collapse_duplicates = TRUE
+)
+```
+
+## Best-hits
+
+```{r}
+auroc_bh <- MetaNeighborUS(var_genes = global_hvgs,
+                           dat = sce,
+                           study_id = sce$dataset,
+                           cell_type = sce$cell_types,
+                           fast_version = TRUE, 
+                           symmetric_output = TRUE,
+                           one_vs_best = T)
+```
+
+```{r}
+plotHeatmap(auroc_bh, cex = 0.5)
+```
 
 
 
 
+
+
+
+
+# to do:
+
+- Instead of only comparing expression of individual markers, define a cytotoxic gene set and calculate a module score in all datasets.
+
+- Compare the populations using correlation / transcriptional similarity: calculate pairwise Spearman correlations, of pseudoubulk per sample. Use sctypeeval? all genes?
+
+- Overlap of GSEA ??
 
 
