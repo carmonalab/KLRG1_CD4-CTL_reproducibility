@@ -73,6 +73,8 @@ library(ProjecTILs)
 library(SignatuR)
 library(BiocParallel)
 library(UCell)
+
+source("utils/utils.R")
 ```
 
 # 1. Load processed datasets
@@ -248,12 +250,71 @@ seu_list$Kwek_2025_39655805$tissue <- case_when(
 
 ```{r}
 allmer <- merge(ref$inhouse, seu_list)
+DefaultAssay(allmer) <- "RNA"
 # subset only for CTL and TFH-like cells
 mer <- allmer[,grepl(sel_ct, allmer@meta.data[[author_annotation]], ignore.case = T)]
 table(mer[[author_annotation]])
 table(mer$tissue, mer$dataset, useNA = "ifany")
 table(mer$treatment, mer$dataset, useNA = "ifany")
 ```
+## Dotplot
+
+```{r}
+mer$ds_ct <- factor(paste(mer$dataset,
+                          mer@meta.data[[author_annotation]],
+                          sep = "|"),
+                    levels = c("ThiStudy|Cytotoxic",
+                               "Kwek_2025_39655805|GZMB+",
+                               "Kwek_2025_39655805|GZMK+",
+                               "Oh_2020_32497499|CD4GZMB",
+                               "Oh_2020_32497499|CD4GZMK"
+                    ))
+dt <- dotplot_seurat_style(
+  object = mer,
+  features = cd4_cytotoxic_markers,
+  ident_col = "ds_ct",
+  split_by = NULL,
+  assay = "RNA",
+  scale_expression = F
+) + 
+  theme(axis.text.y = element_text(size = 18),
+        axis.title = element_blank(),
+        title = element_text(size = 22)) +
+  ggplot2::ggtitle("Cytotoxic marker expression")
+dt
+```
+
+## Violin plot
+
+```{r}
+vln <- VlnPlot(mer,
+               group.by = "ds_ct",
+               features = cd4_cytotoxic_markers, 
+               flip = T,
+               stack = T,
+               fill.by = "ident") +
+  NoLegend()
+  
+```
+
+### export figures
+
+```{r}
+new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
+
+fig_path <- file.path(new_fig, "DotPlot_CTLmarkers_otherDatasets.pdf")
+pdf(fig_path, width = 6, height = 8)
+dt
+dev.off()
+
+fig_path <- file.path(new_fig, "ViolinPlot_CTLmarkers_otherDatasets.pdf")
+pdf(fig_path, width = 3.5, height = 6)
+vln
+dev.off()
+```
+
+
+
 ## Heatmap per sample
 
 ### Build pseudobulk
@@ -787,6 +848,7 @@ phc <- pheatmap(mat = mat,
 ```{r}
 library(MetaNeighbor)
 mer0 <- allmer
+DefaultAssay(mer0) <- "RNA"
 mer0[["HTG"]] <- NULL
 mer0[["integrated"]] <- NULL
 sce <- as.SingleCellExperiment(mer0)
@@ -808,6 +870,18 @@ aurocs <- MetaNeighborUS(var_genes = global_hvgs,
 ```{r}
 plotHeatmap(aurocs, cex = 0.5)
 ```
+
+```{r}
+new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
+
+fig_path <- file.path(new_fig, "MetaNeighbor_heatmap_otherDatasets.pdf")
+
+pdf(fig_path, width = 6, height = 5.5)
+plotHeatmap(aurocs, cex = 0.5)
+dev.off()
+
+```
+
 
 
 ## tophits
