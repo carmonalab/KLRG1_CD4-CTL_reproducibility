@@ -321,7 +321,7 @@ dotplot_seurat_style(
 library(UCell)
 
 sig <- list(cytotoxic_score = cd4_cytotoxic_markers)
-
+DefaultAssay(int) <- "RNA"
 int <- AddModuleScore_UCell(int,
                             features = sig,
                             ncores = 6,
@@ -368,6 +368,28 @@ pdf(fig_path, width = 3, height = 4)
 ctl_score_pl
 dev.off()
 ```
+
+### Violin plot
+
+```{r}
+vln <- VlnPlot(int[,int$annotation == "Cytotoxic"],
+               group.by = "tissue",
+               features = cd4_cytotoxic_markers, 
+               flip = T,
+               stack = T,
+               fill.by = "ident") +
+  scale_fill_manual(values = c("PBMC" = "#0072B2", "TILN" = "#D55E00")) +
+  NoLegend()
+vln
+```
+```{r}
+fig_path <- file.path(new_fig, "violin_cytotoxic_markers_annotation.pdf")
+
+pdf(fig_path, width = 2, height = 5)
+vln
+dev.off()
+```
+
 
 ---
 
@@ -512,6 +534,30 @@ print(table(proj$functional.cluster, useNA = "ifany"))
 proj_prop <- prop.table(table(proj$functional.cluster))
 print(round(proj_prop, 3))
 ```
+
+## 7.3 Feature plots of markers
+
+```{r}
+gene_list <- c("GZMB", "GNLY", "NKG7", "GZMA", "PRF1")
+
+ft <- FeaturePlot(proj,
+                  features = gene_list,
+                  cols = c("grey", "red"),
+                  min.cutoff = 0,
+                  label = F,
+                  order = T)
+```
+
+```{r}
+new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
+
+fig_path <- file.path(new_fig, "TumorSpecific_umap_featureplot_CTL_markers.pdf")
+
+pdf(fig_path, width = 7, height = 9)
+ft
+dev.off()
+```
+
 
 ## 7.3 Gene markers tumor-specific cells
 
