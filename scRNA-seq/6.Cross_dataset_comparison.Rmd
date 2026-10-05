@@ -31,6 +31,8 @@ https://doi.org/10.1016/j.cell.2020.05.017
 - Data source: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE149652
 * Processed (cached): `2.4.Kwek_processing.Rmd`
 
+### Chu et al., 2023
+(https://www.nature.com/articles/s41591-023-02371-y) which identifies T-stressed cell subsets but also a CD4-CTL population
 
 # Goals
 - Signature overlap and label-transfer comparison against these published cytotoxic CD4 datasets.
@@ -91,14 +93,25 @@ sample_id <- "Sample_ID"
 ## Load Seurat into a list to run all code in loops
 ```{r load_seurat}
 file_path <- c("cache/Oh_2020_32497499.rds",
-               "cache/Kwek_2025_39655805.rds")
-seu_list <- bplapply(file_path,
-                     BPPARAM = MulticoreParam(workers = 2, progressbar = T),
-                     function(f){
-                        readRDS(f)
-                     })
-names(seu_list) <- tools::file_path_sans_ext(basename(file_path))  
+               "cache/Kwek_2025_39655805.rds",
+               "cache/ChuY_2023_37248301.rds" # from ChuY_2023_37248301_Nofilt_whole.rds
+) 
+seu_list <- lapply(file_path,
+                   function(f){
+                     readRDS(f)
+                   }) 
+names(seu_list) <- tools::file_path_sans_ext(basename(file_path)) 
+
+# harmonize ChuY dataset
+## Keep only CD4
+seu_list$ChuY_2023_37248301 <- seu_list$ChuY_2023_37248301$CD4
+## choose author's annotation
+seu_list$ChuY_2023_37248301@meta.data[[author_annotation]] <- seu_list$ChuY_2023_37248301@meta.data[["Cellsubtype"]]
+# this dataset do not contain sample, we will have to use batch of origin
+seu_list$ChuY_2023_37248301@meta.data[[sample_id]] <- seu_list$ChuY_2023_37248301@meta.data[["batch"]]
 ```
+
+
 
 What CD4T subtypes are annotated?
 
@@ -212,7 +225,7 @@ tfh_markers <- c("CXCR5", "PDCD1", "CXCL13", "IL21", "TOX")
 feats_heatmap <- c(cd4_cytotoxic_markers, tfh_markers)
 # define which cell types to fetch
 sel_ct <- "cytotoxic|tfh|cxcl13|gzmb|gzmk" # ctl and tfh
-sel_ct <- "cytotoxic|gzmb|gzmk" # only ctl
+sel_ct <- "cytotoxic|gzmb|gzmk|ctl" # only ctl
 ```
 
 ## Join query datasets and inhouse dataset into the same object
@@ -267,7 +280,8 @@ mer$ds_ct <- factor(paste(mer$dataset,
                                "Kwek_2025_39655805|GZMB+",
                                "Kwek_2025_39655805|GZMK+",
                                "Oh_2020_32497499|CD4GZMB",
-                               "Oh_2020_32497499|CD4GZMK"
+                               "Oh_2020_32497499|CD4GZMK",
+                               "ChuY_2023_37248301|Tctl"
                     ))
 dt <- dotplot_seurat_style(
   object = mer,
@@ -294,7 +308,8 @@ vln <- VlnPlot(mer,
                stack = T,
                fill.by = "ident") +
   NoLegend()
-  
+
+vln  
 ```
 
 ### export figures
@@ -303,12 +318,12 @@ vln <- VlnPlot(mer,
 new_fig <- "~/OneDrive - Université de Genève/CSI/LabPapers/Cenerenti_KLRG1_CTL/figures/new_figs_Sep26"
 
 fig_path <- file.path(new_fig, "DotPlot_CTLmarkers_otherDatasets.pdf")
-pdf(fig_path, width = 6, height = 8)
+pdf(fig_path, width = 6.5, height = 8)
 dt
 dev.off()
 
 fig_path <- file.path(new_fig, "ViolinPlot_CTLmarkers_otherDatasets.pdf")
-pdf(fig_path, width = 3.5, height = 6)
+pdf(fig_path, width = 4, height = 6)
 vln
 dev.off()
 ```
@@ -391,6 +406,7 @@ common_feats_ctl <- Reduce(
   list(
     Features(seu_list$Oh_2020_32497499),
     Features(seu_list$Kwek_2025_39655805),
+    Features(seu_list$ChuY_2023_37248301),
     Features(ref$inhouse),
     cd4_cytotoxic_markers
   )
@@ -450,13 +466,15 @@ cdf <- allmer@meta.data %>%
   ungroup() %>% 
   mutate(cell_types = factor(.data[[author_annotation]],
                                              levels = c("Cytotoxic","CD4GZMB",
-                                                        "CD4GZMK", "GZMB+","GZMK+"))
+                                                        "CD4GZMK", "GZMB+","GZMK+",
+                                                        "Tctl"))
          )
 
 comps <- list(c("Cytotoxic", "CD4GZMB"),
               c("Cytotoxic", "CD4GZMK"),
               c("Cytotoxic", "GZMB+"),
-              c("Cytotoxic", "GZMK+")
+              c("Cytotoxic", "GZMK+"),
+              c("Cytotoxic", "Tctl")
               )
   
 # plot
